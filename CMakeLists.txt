@@ -13,7 +13,7 @@ include(FetchContent)
 FetchContent_Declare(
   blake3
   GIT_REPOSITORY https://github.com/BLAKE3-team/BLAKE3
-  GIT_TAG        master
+  GIT_TAG        1.8.7
   SOURCE_SUBDIR  c
 
 )
