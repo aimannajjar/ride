@@ -2,7 +2,7 @@
 
 rm -rf tmp && mkdir ./tmp
 sudo -v
-(sudo ../build/ride) > ./tmp/output.txt &
+(sudo ../build/ride "$PWD"/tmp) > ./tmp/output.txt &
 PID=$!
 
 start=$EPOCHREALTIME
@@ -17,10 +17,12 @@ finish=$EPOCHREALTIME
 elapsed=$(awk -v s="$start" -v e="$finish" 'BEGIN {printf "%.3f", e - s }')
 processed=$(cat tmp/output.txt|wc -l)
 throughput=$(echo "scale=2; $processed/$elapsed" | bc)
-last_dummy=$(cat tmp/output.txt| grep dummy | sort | tail -1)
-last_dummy=${last_dummy: -3}
+last_dummy=$(cat tmp/output.txt| cut -d= -f 1 \
+                | awk '{print $NF}' \
+                | grep -o '[0-9]*' \
+                | sort -n | tail -1)
 
-echo "Test duratoin: $elapsed seconds"
+echo "Test duration: $elapsed seconds"
 echo "Dummy file opens count: ${i}"
 echo "Last Dummy processed: ${last_dummy}"
 echo "Processed count: ${processed}"

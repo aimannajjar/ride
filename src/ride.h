@@ -1,6 +1,7 @@
 #ifndef RIDE_H
 #define RIDE_H
 
+#define USERSPACE_DEBUG
 #define MAX_FILENAME_LEN 256
 #define BPF_RING_BUF_SIZE 4096
 

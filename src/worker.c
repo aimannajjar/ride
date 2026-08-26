@@ -1,6 +1,6 @@
+#include "hasher.h"
 #include "queue.h"
 #include "ride.h"
-#include "hasher.h"
 #include <emmintrin.h>
 #include <stdio.h>
 
@@ -24,10 +24,16 @@ void *worker_run(void *args) {
 
     unsigned char out[HASH_LEN];
     hash(&worker.hashers[0], out, event.path);
-    printf("WORKER %d PROCESSED: %s = ", worker.id, event.path);
+
+#ifdef USERSPACE_DEBUG
+    char debug[512];
+    int mlen;
+    mlen = snprintf(debug, 512, "WORKER %d PROCESSED: %s = ", worker.id, event.path);
     for (size_t i = 0; i < HASH_LEN; i++)
-      printf("%02x", out[i]);
-    printf("\n");
+      snprintf(debug+mlen+i, 512-mlen-i, "%02x", out[i]);
+    snprintf(debug+HASH_LEN+mlen, 2, "\n");
+    printf("%s", debug);
+#endif
   }
 
   return NULL;
