@@ -1,10 +1,12 @@
-#ifndef RIDES_H
-#define RIDES_H
+#ifndef RIDE_H
+#define RIDE_H
+
+#define MAX_FILENAME_LEN 256
 
 struct event {
-  char path[256];
+  char path[MAX_FILENAME_LEN];
 };
 
 int ride_run(int argc, char *argv[]);
 
-#endif
+#endif // RIDE_H

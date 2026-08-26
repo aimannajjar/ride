@@ -20,7 +20,14 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(blake3)
 
 
-file(GLOB_RECURSE SOURCE_FILES src/main.c src/ride.c src/queue.c src/worker.c)
+file(GLOB_RECURSE SOURCE_FILES 
+    src/main.c
+    src/ride.c
+    src/queue.c
+    src/worker.c
+    src/hasher.c
+)
+
 add_executable(ride ${SOURCE_FILES})
 target_include_directories(ride PRIVATE ${CMAKE_SOURCE_DIR}/build)
 target_link_libraries(ride PRIVATE blake3 bpf)
