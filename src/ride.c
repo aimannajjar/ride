@@ -1,6 +1,6 @@
-#include "rides.h"
+#include "ride.h"
 #include "queue.h"
-#include "rides.skel.h"
+#include "ride.skel.h"
 #include "worker.h"
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
@@ -11,7 +11,7 @@
 #include <string.h>
 #include <unistd.h>
 
-struct rides_cli_args {
+struct ride_cli_args {
   char filename[100];
   char db[32];
   char fingerprint_alg[10];
@@ -20,8 +20,8 @@ struct rides_cli_args {
 /** most args are not actually used
  ** except for filename
  **/
-int parse_env(struct rides_cli_args *out, int argc, char *argv[]) {
-  // -d  database file = defaults to rides.db
+int parse_env(struct ride_cli_args *out, int argc, char *argv[]) {
+  // -d  database file = defaults to ride.db
   // -f [FP_ALG] = use fingerprinting, specify algorithm or defaults to SHA-512
   const char optstring[] = ":d:f::";
   while (1) {
@@ -63,12 +63,12 @@ int parse_env(struct rides_cli_args *out, int argc, char *argv[]) {
   return 0;
 }
 
-int rides_run(int argc, char *argv[]) {
-  struct rides_bpf *obj;
+int ride_run(int argc, char *argv[]) {
+  struct ride_bpf *obj;
   struct event event;
   int bpf_queue_fd;
 
-  obj = rides_bpf__open_and_load();
+  obj = ride_bpf__open_and_load();
   bpf_queue_fd = bpf_object__find_map_fd_by_name(obj->obj, "queue");
 
   for (long i = 0; i < 10; i++) {
@@ -76,7 +76,7 @@ int rides_run(int argc, char *argv[]) {
     pthread_create(&thread, NULL, &worker_run, (void *)i);
   }
 
-  rides_bpf__attach(obj);
+  ride_bpf__attach(obj);
 
   while (1) {
     if (bpf_map_lookup_and_delete_elem(bpf_queue_fd, NULL, &event) == 0) {
@@ -84,7 +84,7 @@ int rides_run(int argc, char *argv[]) {
     }
   }
 
-  // struct rides_cli_args args = {
+  // struct ride_cli_args args = {
   //     .filename = {0}, .db = {0}, .fingerprint_alg = {0}};
   //
   // if (parse_env(&args, argc, argv)) {

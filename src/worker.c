@@ -1,5 +1,5 @@
 #include "queue.h"
-#include "rides.h"
+#include "ride.h"
 #include <emmintrin.h>
 #include <stdio.h>
 

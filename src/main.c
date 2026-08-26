@@ -1,7 +1,7 @@
-#include "rides.h"
+#include "ride.h"
 
 // Real-time Intrusion Detection Events System
 int main(int argc, char *argv[]) {
-  return rides_run(argc, argv);
+  return ride_run(argc, argv);
 }
 

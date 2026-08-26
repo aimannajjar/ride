@@ -1,6 +1,6 @@
 .PHONY: cmake clean
 
-NAME 				:= rides
+NAME 				:= ride
 BUILD_DIR		:= build
 SRCS				:= $(wildcard src/*.c)
 BPF_SRCS 		:= $(wildcard src/*.bpf.c)

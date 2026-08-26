@@ -1,4 +1,4 @@
-#include "rides.h"
+#include "ride.h"
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
@@ -101,7 +101,7 @@ bool fs_requires_dev(struct super_block *sb) {
 }
 
 SEC("lsm/file_open")
-int BPF_PROG(rides, struct file *file) {
+int BPF_PROG(ride, struct file *file) {
 
   if (!S_ISREG(file->f_inode->i_mode) ||
       !fs_requires_dev(file->f_inode->i_sb)) {

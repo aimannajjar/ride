@@ -19,6 +19,7 @@
   ];
 
   languages.c.enable = true;
+  languages.rust.enable = true;
 
   env = {
     LIBBPF = "${pkgs.libbpf}/include";

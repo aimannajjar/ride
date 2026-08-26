@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 4.1)
-project(rides 
+project(ride 
   LANGUAGES C CXX
   VERSION 0.0.1
   DESCRIPTION "RIDES - Real-time Intrusion Detection Events System"
@@ -20,8 +20,8 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(blake3)
 
 
-file(GLOB_RECURSE SOURCE_FILES src/main.c src/rides.c src/queue.c src/worker.c)
-add_executable(rides ${SOURCE_FILES})
-target_include_directories(rides PRIVATE ${CMAKE_SOURCE_DIR}/build)
-target_link_libraries(rides PRIVATE blake3 bpf)
+file(GLOB_RECURSE SOURCE_FILES src/main.c src/ride.c src/queue.c src/worker.c)
+add_executable(ride ${SOURCE_FILES})
+target_include_directories(ride PRIVATE ${CMAKE_SOURCE_DIR}/build)
+target_link_libraries(ride PRIVATE blake3 bpf)
 

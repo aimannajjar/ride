@@ -1,4 +1,4 @@
-#include "rides.h"
+#include "ride.h"
 
 #ifndef QUEUE_H
 #define QUEUE_H
