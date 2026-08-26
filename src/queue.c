@@ -1,12 +1,11 @@
 #include "ride.h"
+#include "queue.h"
 #include <emmintrin.h>
 #include <stdalign.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
-
-#define QUEUE_SIZE 64
 
 struct spinlock {
   atomic_bool flag;

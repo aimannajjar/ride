@@ -10,7 +10,7 @@
 
 struct {
   __uint(type, BPF_MAP_TYPE_QUEUE);
-  __uint(max_entries, 16);
+  __uint(max_entries, BPF_RING_BUF_SIZE);
   __type(value, struct event);
 } queue SEC(".maps");
 
