@@ -30,5 +30,5 @@ file(GLOB_RECURSE SOURCE_FILES
 
 add_executable(ride ${SOURCE_FILES})
 target_include_directories(ride PRIVATE ${CMAKE_SOURCE_DIR}/build)
-target_link_libraries(ride PRIVATE blake3 bpf)
+target_link_libraries(ride PRIVATE uring blake3 bpf)
 

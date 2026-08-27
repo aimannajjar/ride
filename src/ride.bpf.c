@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: (MIT OR GPL-2.0)
 #include "ride.h"
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
@@ -66,4 +67,4 @@ int BPF_PROG(ride, struct file *file) {
   return 0;
 }
 
-char LICENSE[] SEC("license") = "Dual BSD/GPL";
+char LICENSE[] SEC("license") = "Dual MIT/GPL";

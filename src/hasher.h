@@ -9,6 +9,9 @@ struct hasher {
   blake3_hasher blake;
 };
 
-int hash(struct hasher *hasher, unsigned char *out, char *file);
+void hasher_init(struct hasher *hasher); 
+void hasher_update(struct hasher *hasher, size_t sz, unsigned char buf[sz]);
+void hasher_finalize(struct hasher *hasher, unsigned char *out, size_t sz);
+int hash_sync(struct hasher *hasher, unsigned char *out, char *file);
 
 #endif

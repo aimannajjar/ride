@@ -3,11 +3,21 @@
 #include <stdio.h>
 #include <string.h>
 
+void hasher_init(struct hasher *hasher) { blake3_hasher_init(&hasher->blake); }
+
+void hasher_update(struct hasher *hasher, size_t sz, unsigned char buf[sz]) {
+  blake3_hasher_update(&hasher->blake, buf, sz);
+}
+
+void hasher_finalize(struct hasher *hasher, unsigned char *out, size_t sz) {
+  blake3_hasher_finalize(&hasher->blake, out, HASH_LEN);
+}
+
 /** hashes file `file` and stores the result in `out`
  ** out must be 32-byte buffer. returns 0 on success
  ** nonzero on errors
  */
-int hash(struct hasher *hasher, unsigned char *out, char *file) {
+int hash_sync(struct hasher *hasher, unsigned char *out, char *file) {
   FILE *fp = fopen(file, "rb");
   if (fp == NULL) {
     perror("open");

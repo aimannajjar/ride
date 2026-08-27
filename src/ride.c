@@ -3,6 +3,7 @@
 #include "ride.skel.h"
 #include "worker.h"
 #include <asm-generic/errno-base.h>
+#include <bits/getopt_core.h>
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include <fcntl.h>
@@ -16,6 +17,8 @@
 struct ride_cli_args {
   char watch_path[100];
   char fingerprint_alg[10];
+  size_t threads;
+  size_t io_concurrency;
 };
 
 static volatile bool quit = false;
@@ -25,21 +28,36 @@ static volatile bool quit = false;
  **/
 int parse_env(struct ride_cli_args *out, int argc, char *argv[]) {
   // -f [FP_ALG] = use fingerprinting, specify algorithm or defaults to BLAKE3
-  // currenlty only BLAKE3 is supported anyway
-  const char optstring[] = ":h::";
+  //               currenlty only BLAKE3 is supported anyway
+  // -t [NUM_THREADS] how many worker threads
+  // -c [IO_CONCURRENCY] how many concurrent IO tasks *per* worker thread
+  const char optstring[] = ":f:t:c:";
   while (1) {
-
     int ch = getopt(argc, argv, optstring);
     if (-1 == ch)
       break;
 
     switch (ch) {
-    case 'h':
+    case 'f':
       if (0 != optarg) {
         strncpy(out->fingerprint_alg, optarg, sizeof(out->fingerprint_alg));
         out->fingerprint_alg[sizeof out->fingerprint_alg - 1] = '\0';
       } else {
         strcpy(out->fingerprint_alg, "BLAKE3");
+      }
+      break;
+    case 't':
+      out->threads = strtoll(optarg, NULL, 0);
+      if (!out->threads || out->threads > MAX_THREADS) {
+        fprintf(stderr, "Invalid threads argument\n");
+        return EXIT_FAILURE;
+      }
+      break;
+    case 'c':
+      out->io_concurrency = strtoll(optarg, NULL, 0);
+      if (!out->io_concurrency || out->io_concurrency > MAX_CONCURENCY) {
+        fprintf(stderr, "Invalid threads argument\n");
+        return EXIT_FAILURE;
       }
       break;
     case ':':
@@ -70,9 +88,11 @@ int ride_ringbuf_handle(void *ctx, void *data, size_t sz) {
   return 0;
 }
 
-
 int ride_run(int argc, char *argv[]) {
-  struct ride_cli_args args = {.watch_path = {0}, .fingerprint_alg = "blake3"};
+  struct ride_cli_args args = {.watch_path = {0},
+                               .fingerprint_alg = "BLAKE3",
+                               .threads = DEFAULT_THREADS,
+                               .io_concurrency = DEFAULT_IO_CONCURRENCY};
 
   if (parse_env(&args, argc, argv)) {
     return EXIT_FAILURE;
@@ -83,8 +103,10 @@ int ride_run(int argc, char *argv[]) {
     return EXIT_FAILURE;
   }
 
-  printf("Starting RIDE with watch_path=%s, fp=%s\n", args.watch_path,
-         args.fingerprint_alg);
+  printf("Starting RIDE with watch_path=%s, fp=%s, threads=%ld, "
+         "io_concurrency=%ld\n",
+         args.watch_path, args.fingerprint_alg, args.threads,
+         args.io_concurrency);
 
   struct ride_bpf *obj;
   struct ring_buffer *rb;
@@ -105,12 +127,19 @@ int ride_run(int argc, char *argv[]) {
   ring_fd = bpf_map__fd(obj->maps.rb);
   rb = ring_buffer__new(ring_fd, ride_ringbuf_handle, NULL, NULL);
 
-  for (long i = 0; i < 10; i++) {
+  for (long i = 0; i < args.threads; i++) {
     pthread_t thread;
-    pthread_create(&thread, NULL, &worker_run, (void *)i);
+    struct worker_args *wargs = malloc(sizeof(struct worker_args));
+    wargs->id = i;
+    wargs->io_concurrency = args.io_concurrency;
+    pthread_create(&thread, NULL, &worker_run, (void *)wargs);
   }
 
-  ride_bpf__attach(obj);
+  if ((err = ride_bpf__attach(obj))) {
+    fprintf(stderr, "bpf attach error: %d\n", err);
+    ring_buffer__free(rb);
+    return EXIT_FAILURE;
+  }
 
   signal(SIGINT, sig_handler);
   while (!quit) {

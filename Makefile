@@ -12,7 +12,7 @@ BPF_CC 			:= clang
 all: $(BUILD_DIR)/$(NAME)
 
 $(BUILD_DIR)/$(NAME): $(SRCS) $(BUILD_DIR)/$(NAME).skel.h | $(BUILD_DIR)
-	cmake -B build -G Ninja
+	cmake -B build -G Ninja # -DCMAKE_BUILD_TYPE=Debug
 	cmake --build build
 
 $(BUILD_DIR)/$(NAME).skel.h: $(BPF_OBJS) | $(BUILD_DIR)

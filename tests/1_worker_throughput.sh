@@ -2,10 +2,22 @@
 
 rm -rf tmp && mkdir ./tmp
 sudo -v
-(sudo ../build/ride "$PWD"/tmp) > ./tmp/output.txt &
+
+# generate dummy files
+echo "generating 1000 8KB files"
+for i in {1..1000}; do
+  dd if=/dev/urandom of="./tmp/dummy${i}" bs=8192 count=1 &>/dev/null
+done
+echo "drop files from cache"
+sudo sync
+echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
+
+echo "start RIDE"
+(sudo ../build/ride "$PWD"/tmp -t 20 -c 32) > ./tmp/output.txt &
 PID=$!
 
 start=$EPOCHREALTIME
+echo "simulate highly concurrent reads"
 for i in {1..1000}; do
   touch "./tmp/dummy${i}" &
 done

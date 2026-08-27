@@ -11,8 +11,10 @@
     pkgs.bear
     pkgs.b3sum
 
-    # needed to compile bpf programs
     pkgs.libbpf
+    pkgs.liburing
+
+    # needed to compile bpf programs
     pkgs.linuxHeaders
     pkgs.llvmPackages.clang-unwrapped # wrapped uses switches incompatible with bpf
 
