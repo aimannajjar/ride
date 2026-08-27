@@ -7,16 +7,16 @@ const volatile char watch_path[MAX_FILENAME_LEN];
 const volatile size_t watch_path_len;
 const volatile pid_t userspace_pid;
 
+#define RINGBUF_SIZE (256 * 1024)
 #define S_IFMT 0170000  /* These bits determine file type.  */
 #define S_IFREG 0100000 /* Regular file.  */
 #define S_ISREG(m) (((m) & S_IFMT) == S_IFREG)
 #define FS_REQUIRES_DEV 1
 
 struct {
-  __uint(type, BPF_MAP_TYPE_QUEUE);
-  __uint(max_entries, BPF_RING_BUF_SIZE);
-  __type(value, struct event);
-} queue SEC(".maps");
+  __uint(type, BPF_MAP_TYPE_RINGBUF);
+  __uint(max_entries, 256 * 1024);
+} rb SEC(".maps");
 
 bool fs_requires_dev(struct super_block *sb) {
   return sb->s_type && (sb->s_type->fs_flags & FS_REQUIRES_DEV);
@@ -42,7 +42,7 @@ bool in_watch_path(const char *path, int plen) {
 
 SEC("lsm/file_open")
 int BPF_PROG(ride, struct file *file) {
-  if (bpf_get_current_pid_tgid() >> 32  == userspace_pid)
+  if (bpf_get_current_pid_tgid() >> 32 == userspace_pid)
     return 0;
 
   if (!S_ISREG(file->f_inode->i_mode) ||
@@ -50,16 +50,20 @@ int BPF_PROG(ride, struct file *file) {
     return 0;
   }
 
-  struct event ev;
-  bpf_path_d_path(&file->f_path, ev.path, sizeof(ev.path));
-  
-  if (!in_watch_path(ev.path, watch_path_len))
+  struct event *ev;
+  ev = bpf_ringbuf_reserve(&rb, sizeof(*ev), 0);
+  if (!ev)
     return 0;
+  bpf_path_d_path(&file->f_path, ev->path, sizeof(ev->path));
 
-  bpf_map_push_elem(&queue, &ev, 0);
+  if (!in_watch_path(ev->path, watch_path_len)) {
+    bpf_ringbuf_discard(ev, 0);
+    return 0;
+  }
+
+  bpf_ringbuf_submit(ev, BPF_RB_FORCE_WAKEUP);
 
   return 0;
 }
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
-

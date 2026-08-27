@@ -2,10 +2,12 @@
 #include "queue.h"
 #include "ride.skel.h"
 #include "worker.h"
+#include <asm-generic/errno-base.h>
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,6 +17,8 @@ struct ride_cli_args {
   char watch_path[100];
   char fingerprint_alg[10];
 };
+
+static volatile bool quit = false;
 
 /** most args are not actually used
  ** except for filename
@@ -59,11 +63,16 @@ int parse_env(struct ride_cli_args *out, int argc, char *argv[]) {
   return 0;
 }
 
+static void sig_handler(int signal) { quit = true; }
+
+int ride_ringbuf_handle(void *ctx, void *data, size_t sz) {
+  queue_add((struct event *)data);
+  return 0;
+}
+
+
 int ride_run(int argc, char *argv[]) {
-  struct ride_cli_args args = {
-      .watch_path = {0},
-      .fingerprint_alg = "blake3"
-  };
+  struct ride_cli_args args = {.watch_path = {0}, .fingerprint_alg = "blake3"};
 
   if (parse_env(&args, argc, argv)) {
     return EXIT_FAILURE;
@@ -78,12 +87,13 @@ int ride_run(int argc, char *argv[]) {
          args.fingerprint_alg);
 
   struct ride_bpf *obj;
+  struct ring_buffer *rb;
   struct event event;
-  int bpf_queue_fd;
+  int ring_fd;
   int err;
 
   obj = ride_bpf__open();
-  strncpy(obj->rodata->watch_path, args.watch_path, MAX_FILENAME_LEN); 
+  strncpy(obj->rodata->watch_path, args.watch_path, MAX_FILENAME_LEN);
   obj->rodata->watch_path_len = strlen(args.watch_path);
   obj->rodata->userspace_pid = getpid();
 
@@ -92,7 +102,8 @@ int ride_run(int argc, char *argv[]) {
     return EXIT_FAILURE;
   }
 
-  bpf_queue_fd = bpf_object__find_map_fd_by_name(obj->obj, "queue");
+  ring_fd = bpf_map__fd(obj->maps.rb);
+  rb = ring_buffer__new(ring_fd, ride_ringbuf_handle, NULL, NULL);
 
   for (long i = 0; i < 10; i++) {
     pthread_t thread;
@@ -101,11 +112,17 @@ int ride_run(int argc, char *argv[]) {
 
   ride_bpf__attach(obj);
 
-  while (1) {
-    if (bpf_map_lookup_and_delete_elem(bpf_queue_fd, NULL, &event) == 0) {
-      queue_add(&event);
+  signal(SIGINT, sig_handler);
+  while (!quit) {
+    err = ring_buffer__poll(rb, 100);
+    if (err < 0 && err != -EINTR) {
+      perror("ringbuf poll error");
+      break;
     }
   }
 
-
+  ring_buffer__free(rb);
+  if (err)
+    return EXIT_FAILURE;
+  return EXIT_SUCCESS;
 }

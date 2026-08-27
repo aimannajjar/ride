@@ -3,6 +3,7 @@
 #include "ride.h"
 #include <emmintrin.h>
 #include <stdio.h>
+// #include <liburing.h>
 
 #define CONCURRENT_TASKS 2
 
@@ -10,6 +11,7 @@ struct worker {
   int id;
   char tasks[CONCURRENT_TASKS][MAX_FILENAME_LEN];
   struct hasher hashers[CONCURRENT_TASKS];
+  // struct io_uring ring;
 };
 
 void *worker_run(void *args) {
