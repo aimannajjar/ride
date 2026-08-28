@@ -1,0 +1,111 @@
+(devenv) [1 suspended] ➜  tests git:(main) ✗ ./5_worker_throughput_multi_run.sh
+------- Open-loop throughput test 5  -------
+
+Test Paramters
+---------------
+DURATION:		5000 ms
+SKIP CORRECTNESS:	1
+EMPTY_FILES:		0
+DUMMY_FILES_N:		25000
+----------------
+
+> Start RIDE
+> Simulate highly concurrent reads in background
+> Start measuring
+> Done!
+! Skipping correctness per test parameters, assume all reads correct
+
+----------------------------------------
+Test duration: 5.003 seconds
+Dummy file opens count:
+Procssed count: 16566
+Throughput: 3311 files/sec
+
+------- Open-loop throughput test 5  -------
+
+Test Paramters
+---------------
+DURATION:		5000 ms
+SKIP CORRECTNESS:	1
+EMPTY_FILES:		0
+DUMMY_FILES_N:		25000
+----------------
+
+> Start RIDE
+> Simulate highly concurrent reads in background
+> Start measuring
+> Done!
+! Skipping correctness per test parameters, assume all reads correct
+
+----------------------------------------
+Test duration: 5.003 seconds
+Dummy file opens count:
+Procssed count: 14120
+Throughput: 2822 files/sec
+
+------- Open-loop throughput test 5  -------
+
+Test Paramters
+---------------
+DURATION:		5000 ms
+SKIP CORRECTNESS:	1
+EMPTY_FILES:		0
+DUMMY_FILES_N:		25000
+----------------
+
+> Start RIDE
+> Simulate highly concurrent reads in background
+> Start measuring
+> Done!
+! Skipping correctness per test parameters, assume all reads correct
+
+----------------------------------------
+Test duration: 5.003 seconds
+Dummy file opens count:
+Procssed count: 16319
+Throughput: 3261 files/sec
+
+------- Open-loop throughput test 5  -------
+
+Test Paramters
+---------------
+DURATION:		5000 ms
+SKIP CORRECTNESS:	1
+EMPTY_FILES:		0
+DUMMY_FILES_N:		25000
+----------------
+
+> Start RIDE
+> Simulate highly concurrent reads in background
+> Start measuring
+> Done!
+! Skipping correctness per test parameters, assume all reads correct
+
+----------------------------------------
+Test duration: 5.003 seconds
+Dummy file opens count:
+Procssed count: 14037
+Throughput: 2805 files/sec
+
+------- Open-loop throughput test 5  -------
+
+Test Paramters
+---------------
+DURATION:		5000 ms
+SKIP CORRECTNESS:	1
+EMPTY_FILES:		0
+DUMMY_FILES_N:		25000
+----------------
+
+> Start RIDE
+> Simulate highly concurrent reads in background
+> Start measuring
+> Done!
+! Skipping correctness per test parameters, assume all reads correct
+
+----------------------------------------
+Test duration: 5.003 seconds
+Dummy file opens count:
+Procssed count: 15989
+Throughput: 3195 files/sec
+

@@ -53,8 +53,10 @@ int BPF_PROG(ride, struct file *file) {
 
   struct event *ev;
   ev = bpf_ringbuf_reserve(&rb, sizeof(*ev), 0);
-  if (!ev)
+  if (!ev) {
+    // TODO: account drops
     return 0;
+  }
   bpf_path_d_path(&file->f_path, ev->path, sizeof(ev->path));
 
   if (!in_watch_path(ev->path, watch_path_len)) {

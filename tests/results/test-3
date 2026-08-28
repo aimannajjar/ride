@@ -1,0 +1,23 @@
+------- Open-loop throughput test 3  -------
+
+Test Paramters
+---------------
+DURATION:		1000 ms
+SKIP CORRECTNESS:	1
+EMPTY_FILES:		1
+DUMMY_FILES_N:		10000
+----------------
+
+> Drop caches
+> Start RIDE
+> Simulate highly concurrent reads in background
+> Start measuring
+> Done!
+! Skipping correctness per test parameters, assume all reads correct
+
+----------------------------------------
+Test duration: 1.002 seconds
+Dummy file opens count: 
+Procssed count: 5264
+Throughput: 5253 files/sec
+

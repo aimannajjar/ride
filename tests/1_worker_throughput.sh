@@ -1,42 +1,15 @@
 #!/usr/bin/env bash
 
-rm -rf tmp && mkdir ./tmp
-sudo -v
+### End-to-end cold-cache throughput (short window)
+## Open-loop load for 250ms over 8KB random payloads, caches dropped.
+## Verifies every hash against b3sum, then measures throughput.
+## Slower, but provides full end-to-end validation.
+###
 
-# generate dummy files
-echo "generating 1000 8KB files"
-for i in {1..1000}; do
-  dd if=/dev/urandom of="./tmp/dummy${i}" bs=8192 count=1 &>/dev/null
-done
-echo "drop files from cache"
-sudo sync
-echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
-
-echo "start RIDE"
-(sudo ../build/ride "$PWD"/tmp -t 20 -c 32) > ./tmp/output.txt &
-PID=$!
-
-start=$EPOCHREALTIME
-echo "simulate highly concurrent reads"
-for i in {1..1000}; do
-  touch "./tmp/dummy${i}" &
-done
-sleep 1; # will deflate througput but that's ok since we're applying consistently
-         # need it process last message until we gracefully handle interrupts
-kill $PID
-wait $PID
-finish=$EPOCHREALTIME
-elapsed=$(awk -v s="$start" -v e="$finish" 'BEGIN {printf "%.3f", e - s }')
-processed=$(cat tmp/output.txt|wc -l)
-throughput=$(echo "scale=2; $processed/$elapsed" | bc)
-last_dummy=$(cat tmp/output.txt| cut -d= -f 1 \
-                | awk '{print $NF}' \
-                | grep -o '[0-9]*' \
-                | sort -n | tail -1)
-
-echo "Test duration: $elapsed seconds"
-echo "Dummy file opens count: ${i}"
-echo "Last Dummy processed: ${last_dummy}"
-echo "Processed count: ${processed}"
-echo "Throughput: ${throughput} files/sec"
+ID=1
+DURATION=0.25
+SKIP_CORRECTNESS=0
+DUMMY_FILES_N=4000
+EMPTY_FILES=0
+bash ./0_worker_throughput.sh ${ID} ${DURATION} ${SKIP_CORRECTNESS} ${DUMMY_FILES_N} ${EMPTY_FILES}
 

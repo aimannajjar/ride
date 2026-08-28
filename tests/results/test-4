@@ -1,0 +1,26 @@
+------- Open-loop throughput test 4  -------
+
+Test Paramters
+---------------
+DURATION:		5000 ms
+SKIP CORRECTNESS:	0
+EMPTY_FILES:		0
+DUMMY_FILES_N:		15000
+----------------
+
+> Generate 15000 8KB files
+> Flush and drop caches
+> Drop caches
+> Start RIDE
+> Simulate highly concurrent reads in background
+> Start measuring
+> Done!
+> Test correctness against b3sum
+
+----------------------------------------
+Test duration: 5.003 seconds
+Dummy file opens count: 15000
+Correct hashes count: 14616
+Wrong hashes count: 0
+Throughput: 2921 files/sec
+
