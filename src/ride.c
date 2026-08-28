@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <jemalloc/jemalloc.h>
 
 struct ride_cli_args {
   char watch_path[100];
@@ -56,7 +57,7 @@ int parse_env(struct ride_cli_args *out, int argc, char *argv[]) {
     case 'c':
       out->io_concurrency = strtoll(optarg, NULL, 0);
       if (!out->io_concurrency || out->io_concurrency > MAX_CONCURENCY) {
-        fprintf(stderr, "Invalid threads argument\n");
+        fprintf(stderr, "Invalid concurrency argument\n");
         return EXIT_FAILURE;
       }
       break;
@@ -81,7 +82,12 @@ int parse_env(struct ride_cli_args *out, int argc, char *argv[]) {
   return 0;
 }
 
-static void sig_handler(int signal) { quit = true; }
+static void sig_handler(int signal) { 
+  quit = true;
+#ifdef USERSPACE_TRACE
+  malloc_stats_print(NULL, NULL, NULL);
+#endif
+}
 
 int ride_ringbuf_handle(void *ctx, void *data, size_t sz) {
   queue_add((struct event *)data);
@@ -110,7 +116,6 @@ int ride_run(int argc, char *argv[]) {
 
   struct ride_bpf *obj;
   struct ring_buffer *rb;
-  struct event event;
   int ring_fd;
   int err;
 

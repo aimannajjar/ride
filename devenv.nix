@@ -5,19 +5,22 @@
 
 {
   packages = [
+    # tools
     pkgs.cmake
     pkgs.gnumake
     pkgs.ninja
     pkgs.bear
     pkgs.b3sum
+    pkgs.jq
 
+    # libs
     pkgs.libbpf
     pkgs.liburing
+    pkgs.jemalloc
 
     # needed to compile bpf programs
     pkgs.linuxHeaders
     pkgs.llvmPackages.clang-unwrapped # wrapped uses switches incompatible with bpf
-
   ];
 
   languages.c.enable = true;

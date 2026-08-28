@@ -2,7 +2,7 @@
 #define WORKER_H
 #include <stddef.h>
 
-#define MAX_CONCURRENT_TASKS 32 
+#define MAX_CONCURRENT_TASKS 256
 
 struct worker_args {
   size_t id;

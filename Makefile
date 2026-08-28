@@ -11,7 +11,7 @@ BPF_CC 			:= clang
 
 all: $(BUILD_DIR)/$(NAME)
 
-$(BUILD_DIR)/$(NAME): $(SRCS) $(BUILD_DIR)/$(NAME).skel.h | $(BUILD_DIR)
+$(BUILD_DIR)/$(NAME): $(SRCS) $(BUILD_DIR)/$(NAME).skel.h CMakeLists.txt | $(BUILD_DIR)
 	cmake -B build -G Ninja # -DCMAKE_BUILD_TYPE=Debug
 	cmake --build build
 

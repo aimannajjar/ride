@@ -6,6 +6,7 @@ project(ride
 )
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3 -Wall -Werror")
 set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -O0 -g")
 
 # use official blake3 implementation
@@ -30,5 +31,5 @@ file(GLOB_RECURSE SOURCE_FILES
 
 add_executable(ride ${SOURCE_FILES})
 target_include_directories(ride PRIVATE ${CMAKE_SOURCE_DIR}/build)
-target_link_libraries(ride PRIVATE uring blake3 bpf)
+target_link_libraries(ride PRIVATE jemalloc uring blake3 bpf)
 

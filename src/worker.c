@@ -12,7 +12,6 @@
 #include <string.h>
 #include <unistd.h>
 
-#define MAX_CONCURRENT_TASKS 32
 #define READ_BUF_SIZE 4096
 
 enum task_state {
@@ -23,16 +22,16 @@ enum task_state {
 struct worker {
   // io_uring
   struct io_uring ring;
-  size_t io_tasks;
+  size_t nr_tasks;
 
   // per-task SoAs to keep elements nearby in cache line during async event loop
-  unsigned char read_buffers[MAX_CONCURRENT_TASKS][READ_BUF_SIZE];
-  unsigned char hashes[MAX_CONCURRENT_TASKS][HASH_LEN];
-  char *task_paths[MAX_CONCURRENT_TASKS];
-  int fds[MAX_CONCURRENT_TASKS];
-  off_t offsets[MAX_CONCURRENT_TASKS];
-  enum task_state states[MAX_CONCURRENT_TASKS];
-  struct hasher hashers[MAX_CONCURRENT_TASKS];
+  unsigned char (*read_buffers)[READ_BUF_SIZE];
+  unsigned char (*hashes)[HASH_LEN];
+  char **task_paths;
+  int *fds;
+  off_t *offsets;
+  enum task_state *states;
+  struct hasher *hashers;
 
   int pending_tasks;
   int next_task_idx;
@@ -40,17 +39,38 @@ struct worker {
 };
 
 void worker_setup(struct worker *worker, struct worker_args *wargs) {
+  worker->id = wargs->id;
   worker->pending_tasks = 0;
   worker->next_task_idx = 0;
-  worker->io_tasks = wargs->io_concurrency;
+  worker->nr_tasks = wargs->io_concurrency;
+  worker->hashes = malloc(worker->nr_tasks * sizeof(unsigned char) * HASH_LEN);
+  worker->fds = malloc(worker->nr_tasks * sizeof(int));
+  worker->offsets = malloc(worker->nr_tasks * sizeof(off_t));
+  worker->states = malloc(worker->nr_tasks * sizeof(enum task_state));
+  worker->hashers = malloc(worker->nr_tasks * sizeof(struct hasher));
+  worker->read_buffers =
+      malloc(worker->nr_tasks * sizeof(unsigned char) * READ_BUF_SIZE);
+  worker->task_paths =
+      malloc(worker->nr_tasks * sizeof(char) * MAX_FILENAME_LEN);
 
   size_t i;
-  for (i = 0; i < worker->io_tasks; i++) {
+  for (i = 0; i < worker->nr_tasks; i++) {
     worker->states[i] = AVAILABLE;
   }
 
   // setup io_uring
-  io_uring_queue_init(worker->io_tasks, &worker->ring, 0);
+  io_uring_queue_init(worker->nr_tasks, &worker->ring, 0);
+}
+
+void worker_free(struct worker *worker) {
+  free(worker->hashes);
+  free(worker->fds);
+  free(worker->offsets);
+  free(worker->states);
+  free(worker->hashers);
+  free(worker->read_buffers);
+  free(worker->task_paths);
+  io_uring_queue_exit(&worker->ring);
 }
 
 // Performs bookkeeping for tasks in worker:
@@ -73,8 +93,8 @@ int task_init(struct worker *worker, struct event *event, int fd) {
   worker->pending_tasks++;
 
   // find next available task
-  if (worker->pending_tasks < worker->io_tasks) {
-    for (i = 0; i < worker->io_tasks; i++) {
+  if (worker->pending_tasks < worker->nr_tasks) {
+    for (i = 0; i < worker->nr_tasks; i++) {
       if (worker->states[i] == AVAILABLE) {
         worker->next_task_idx = i;
         return my_index;
@@ -115,7 +135,6 @@ void *worker_run(void *args) {
   free(wargs);
 
   wargs = NULL;
-  bool new_task;
   int new_task_idx;
   while (1) {
     int fd;
@@ -128,7 +147,7 @@ void *worker_run(void *args) {
         _mm_pause(); // TODO: portability
       }
       new_task = true;
-    } else if (worker.pending_tasks < worker.io_tasks) {
+    } else if (worker.pending_tasks < worker.nr_tasks) {
       // we have pending tasks, but we can take more, take one
       queue_consume(event);
       new_task = true;
@@ -149,9 +168,9 @@ void *worker_run(void *args) {
     }
 
     while (worker.pending_tasks) {
-      struct io_uring_cqe *cqes[worker.io_tasks];
+      struct io_uring_cqe *cqes[worker.nr_tasks];
       size_t i, n;
-      n = io_uring_peek_batch_cqe(&worker.ring, cqes, worker.io_tasks);
+      n = io_uring_peek_batch_cqe(&worker.ring, cqes, worker.nr_tasks);
 
       // process completions
       for (i = 0; i < n; i++) {
@@ -176,13 +195,14 @@ void *worker_run(void *args) {
 #ifdef USERSPACE_DEBUG
           char debug[1024];
           int mlen;
-          mlen = snprintf(debug, 1024, "WORKER %d PROCESSED: %s = ", worker.id,
-                          worker.task_paths[task_idx]);
+          mlen = snprintf(debug, 1024,
+                          "{ \"worker\": %d, \"file\": \"%s\", \"hash\": \"",
+                          worker.id, worker.task_paths[task_idx]);
           for (i = 0; i < HASH_LEN; i++) {
             mlen += snprintf(debug + mlen, 512 - mlen, "%02x",
                              worker.hashes[task_idx][i]);
           }
-          printf("%s\n", debug);
+          printf("%s\" }\n", debug);
 #endif
           task_free(&worker, task_idx);
         }
@@ -192,6 +212,6 @@ void *worker_run(void *args) {
     }
   }
 
+  worker_free(&worker);
   return NULL;
 }
-
