@@ -31,17 +31,25 @@ DUMMY_FILES_N=${4:-2000}
 EMPTY_FILES=${5:-0}
 USE_PRE_EXISITNG_DUMMIES=1
 
+RIDE_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+RIDE="${RIDE_ROOT}/build/ride"
+TMP="${RIDE_ROOT}/tests/tmp"
+if [ ! -f "$RIDE" ]; then
+  echo "./build/ride was not found, did you build the project?"
+  exit 1
+fi
+
 if (( ! USE_PRE_EXISITNG_DUMMIES )); then
-    rm -rf tmp && mkdir ./tmp
+    rm -rf "$TMP" && mkdir "$TMP"
 else
-    echo "WARNING: Using existing payloads in tmp/dummy0..${DUMMY_FILES_N}, " \
+    echo "WARNING: Using existing payloads in ${TMP}/dummy0..${DUMMY_FILES_N}, " \
          "if files don't exist results will be wrong " \
          "(unset USE_PRE_EXISITNG_DUMMIES to re-generate)"
-    rm ./tmp/output.txt
+    rm "$TMP"/output.txt
 fi
 
 sudo -v
-touch ./tmp/output.txt
+touch "$TMP"/output.txt
 
 echo "------- Open-loop throughput test ${ID}  -------"
 echo 
@@ -56,7 +64,7 @@ echo
 if (( ! EMPTY_FILES && ! USE_PRE_EXISITNG_DUMMIES )); then
   echo "> Generate ${DUMMY_FILES_N} 8KB files"
   for ((i=0;i<DUMMY_FILES_N;i++)); do
-    dd if=/dev/urandom of="./tmp/dummy${i}" bs=8192 count=1 &>/dev/null
+    dd if=/dev/urandom of="${TMP}/dummy${i}" bs=8192 count=1 &>/dev/null
   done
   echo "> Flush and drop caches"
   sudo sync
@@ -66,12 +74,12 @@ echo "> Drop caches"
 echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
 
 echo "> Start RIDE"
-(sudo ../build/ride "$PWD"/tmp -t 2 -c 2) > ./tmp/output.txt &
+(sudo "${RIDE}" "$TMP" -t 2 -c 2) > "$TMP"/output.txt &
 PID=$!
 sleep 0.75
 
 echo "> Simulate highly concurrent reads in background"
-bash "${PWD}/offered_load.sh" "$DUMMY_FILES_N" &
+bash "${RIDE_ROOT}/tests/offered_load.sh" "$DUMMY_FILES_N" &
 WORKLAOD_PID=$!
 
 echo "> Start measuring"
@@ -111,10 +119,10 @@ if (( ! SKIP_CORRECTNESS )); then
       pass_count=$((pass_count+1))
     fi
   
-  done } < "./tmp/output.txt"
+  done } < "${TMP}/output.txt"
 else
   echo "! Skipping correctness per test parameters, assume all reads correct"
-  pass_count=$(tail -n +2 tmp/output.txt | wc -l)
+  pass_count=$(tail -n +2 "$TMP"/output.txt | wc -l)
   pass_count=$((pass_count-1))  # last process was probably interrupted
 fi;
 
