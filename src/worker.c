@@ -9,15 +9,37 @@
 #include <fcntl.h>
 #include <jemalloc/jemalloc.h>
 #include <liburing.h>
+#include <stdalign.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 
-#define READ_BUF_SIZE 4096
+#define READ_BUF_SIZE 65536
+static_assert(!(READ_BUF_SIZE & (4096 - 1)), "BUFFER SIZE must be 4K aligned");
+
+enum task_type {
+  HASHING,
+};
 
 enum task_state {
   AVAILABLE,
   READING,
+};
+
+struct task_hashing {
+  unsigned char hash[HASH_LEN];
+  unsigned char path[MAX_FILENAME_LEN];
+  struct hasher hasher;
+  off_t offset;
+  int fd;
+};
+
+struct task {
+  union {
+    struct task_hashing hashing_task;
+  } as;
+  enum task_type type;
+  enum task_state state;
 };
 
 struct worker {
@@ -25,39 +47,26 @@ struct worker {
   struct io_uring ring;
   size_t nr_tasks;
 
-  // per-task SoAs to keep elements nearby in cache line during async event loop
-  unsigned char (*read_buffers)[READ_BUF_SIZE];
-  unsigned char (*hashes)[HASH_LEN];
-  char (*task_paths)[MAX_FILENAME_LEN];
-  int *fds;
-  off_t *offsets;
-  enum task_state *states;
-  struct hasher *hashers;
+  unsigned char (*buffers)[READ_BUF_SIZE];
 
+  struct task *task_slots;
   int pending_tasks;
-  int next_task_idx;
+  int next_task_slot;
   int id;
 };
 
 void worker_setup(struct worker *worker, struct worker_args *wargs) {
   worker->id = wargs->id;
   worker->pending_tasks = 0;
-  worker->next_task_idx = 0;
+  worker->next_task_slot = 0;
   worker->nr_tasks = wargs->io_concurrency;
-  worker->hashes = malloc(worker->nr_tasks * sizeof(unsigned char) * HASH_LEN);
-  worker->fds = malloc(worker->nr_tasks * sizeof(int));
-  worker->offsets = malloc(worker->nr_tasks * sizeof(off_t));
-  worker->states = malloc(worker->nr_tasks * sizeof(enum task_state));
-  worker->hashers = malloc(worker->nr_tasks * sizeof(struct hasher));
-  worker->read_buffers =
-      mallocx(worker->nr_tasks * sizeof(unsigned char) * READ_BUF_SIZE,
-              MALLOCX_ALIGN(4096));
-  worker->task_paths =
-      malloc(worker->nr_tasks * sizeof(char) * MAX_FILENAME_LEN);
-
+  worker->task_slots =
+      mallocx(worker->nr_tasks * sizeof(struct task), MALLOCX_ZERO);
+  worker->buffers =
+      aligned_alloc(4096, worker->nr_tasks * sizeof(*worker->buffers));
   size_t i;
   for (i = 0; i < worker->nr_tasks; i++) {
-    worker->states[i] = AVAILABLE;
+    worker->task_slots[i].state = AVAILABLE;
   }
 
   // setup io_uring
@@ -65,13 +74,8 @@ void worker_setup(struct worker *worker, struct worker_args *wargs) {
 }
 
 void worker_free(struct worker *worker) {
-  free(worker->hashes);
-  free(worker->fds);
-  free(worker->offsets);
-  free(worker->states);
-  free(worker->hashers);
-  free(worker->read_buffers);
-  free(worker->task_paths);
+  free(worker->task_slots);
+  free(worker->buffers);
   io_uring_queue_exit(&worker->ring);
 }
 
@@ -82,47 +86,56 @@ void worker_free(struct worker *worker) {
 // struct event must be on the heap
 // actual task submission to io_uring is done in task_io_submit
 int task_init(struct worker *worker, struct event *event, int fd) {
-  size_t i, my_index;
-  assert(worker->states[worker->next_task_idx] == AVAILABLE);
-  my_index = worker->next_task_idx;
-  worker->fds[my_index] = fd;
-  worker->offsets[my_index] = 0;
-  worker->states[my_index] = READING;
-  memset(worker->hashes[my_index], 0, sizeof(worker->hashes[0]));
-  memcpy(worker->task_paths[my_index], event->path,
-         sizeof(worker->task_paths[0]));
-  hasher_init(&worker->hashers[my_index]);
+  size_t i, task_slot_idx;
+  struct task *task;
+  assert(worker->task_slots[worker->next_task_slot].state == AVAILABLE &&
+         "Bug: assigned task without available task slot");
+
+  task_slot_idx = worker->next_task_slot;
+  task = &worker->task_slots[task_slot_idx];
+  task->as.hashing_task.fd = fd;
+  task->as.hashing_task.offset = 0;
+  task->state = READING;
+  task->type = HASHING;
+
+  memset(task->as.hashing_task.hash, 0, sizeof(task->as.hashing_task.hash));
+  memcpy(task->as.hashing_task.path, event->path,
+         sizeof(task->as.hashing_task.path));
+  hasher_init(&task->as.hashing_task.hasher);
   worker->pending_tasks++;
 
   // find next available task
   if (worker->pending_tasks < worker->nr_tasks) {
     for (i = 0; i < worker->nr_tasks; i++) {
-      if (worker->states[i] == AVAILABLE) {
-        worker->next_task_idx = i;
-        return my_index;
+      if (worker->task_slots[i].state == AVAILABLE) {
+        worker->next_task_slot = i;
+        return task_slot_idx;
       }
     }
     assert(false && "Bug: pending_tasks / states discrepancy");
   }
 
-  return my_index;
+  return task_slot_idx;
 }
 
 // submits a given task to io_uring
 // can be reused to read chunks
-void task_io_submit(struct worker *worker, size_t index) {
+void task_io_submit(struct worker *worker, size_t tid) {
   struct io_uring_sqe *sqe;
+  struct task_hashing *task = &worker->task_slots[tid].as.hashing_task;
   sqe = io_uring_get_sqe(&worker->ring);
-  io_uring_prep_read(sqe, worker->fds[index], worker->read_buffers[index],
-                     sizeof(worker->read_buffers[0]), worker->offsets[index]);
-  io_uring_sqe_set_data(sqe, (void *)index);
+  io_uring_prep_read(sqe, task->fd, worker->buffers[tid],
+                     sizeof(*worker->buffers), task->offset);
+  io_uring_sqe_set_data(sqe, (void *)tid);
   io_uring_submit(&worker->ring);
 }
 
 void task_free(struct worker *worker, size_t index) {
-  worker->task_paths[index][0] = '\0';
-  worker->states[index] = AVAILABLE;
-  worker->next_task_idx = index;
+  struct task *task = &worker->task_slots[index];
+  task->as.hashing_task.path[0] = '\0';
+  task->state = AVAILABLE;
+  close(task->as.hashing_task.fd);
+  worker->next_task_slot = index;
   worker->pending_tasks--;
 }
 
@@ -170,37 +183,35 @@ void *worker_run(void *args) {
 
       // process completions
       for (i = 0; i < n; i++) {
-        size_t task_idx = (size_t)io_uring_cqe_get_data(cqes[i]);
+        size_t tid = (size_t)io_uring_cqe_get_data(cqes[i]);
+        struct task_hashing *task = &worker.task_slots[tid].as.hashing_task;
         if (cqes[i]->res < 0) {
           // TODO: logging macros
-          fprintf(stderr, "Error async read: %s: %s\n",
-                  worker.task_paths[task_idx], strerror(cqes[i]->res));
-          task_free(&worker, task_idx);
+          fprintf(stderr, "Error async read: %s: %s\n", task->path,
+                  strerror(-cqes[i]->res));
+          task_free(&worker, tid);
           continue;
         } else if (cqes[i]->res > 0) {
-          hasher_update(&worker.hashers[task_idx], cqes[i]->res,
-                        worker.read_buffers[task_idx]);
+          hasher_update(&task->hasher, cqes[i]->res, worker.buffers[tid]);
 
           // read next chunk
-          worker.offsets[task_idx] += cqes[i]->res;
-          task_io_submit(&worker, task_idx);
+          task->offset += cqes[i]->res;
+          task_io_submit(&worker, tid);
         } else {
-          hasher_finalize(&worker.hashers[task_idx], worker.hashes[task_idx],
-                          HASH_LEN);
+          hasher_finalize(&task->hasher, task->hash, sizeof(task->hash));
 
 #ifdef USERSPACE_DEBUG
           char debug[1024];
           int mlen;
           mlen = snprintf(debug, 1024,
                           "{ \"worker\": %d, \"file\": \"%s\", \"hash\": \"",
-                          worker.id, worker.task_paths[task_idx]);
+                          worker.id, task->path);
           for (int j = 0; j < HASH_LEN; j++) {
-            mlen += snprintf(debug + mlen, 512 - mlen, "%02x",
-                             worker.hashes[task_idx][j]);
+            mlen += snprintf(debug + mlen, 512 - mlen, "%02x", task->hash[j]);
           }
           printf("%s\" }\n", debug);
 #endif
-          task_free(&worker, task_idx);
+          task_free(&worker, tid);
         }
       }
 
