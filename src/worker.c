@@ -50,6 +50,8 @@ struct worker {
   unsigned char (*buffers)[READ_BUF_SIZE];
 
   struct task *task_slots;
+  int available_slots;
+  int pending_submits;
   int pending_tasks;
   int next_task_slot;
   int id;
@@ -58,8 +60,10 @@ struct worker {
 void worker_setup(struct worker *worker, struct worker_args *wargs) {
   worker->id = wargs->id;
   worker->pending_tasks = 0;
+  worker->pending_submits = 0;
   worker->next_task_slot = 0;
   worker->nr_tasks = wargs->io_concurrency;
+  worker->available_slots = worker->nr_tasks;
   worker->task_slots =
       mallocx(worker->nr_tasks * sizeof(struct task), MALLOCX_ZERO);
   worker->buffers =
@@ -102,17 +106,18 @@ int task_init(struct worker *worker, struct event *event, int fd) {
   memcpy(task->as.hashing_task.path, event->path,
          sizeof(task->as.hashing_task.path));
   hasher_init(&task->as.hashing_task.hasher);
+  worker->available_slots--;
   worker->pending_tasks++;
 
   // find next available task
-  if (worker->pending_tasks < worker->nr_tasks) {
+  if (worker->available_slots > 0) {
     for (i = 0; i < worker->nr_tasks; i++) {
       if (worker->task_slots[i].state == AVAILABLE) {
         worker->next_task_slot = i;
         return task_slot_idx;
       }
     }
-    assert(false && "Bug: pending_tasks / states discrepancy");
+    assert(false && "Bug: available_slots / states discrepancy");
   }
 
   return task_slot_idx;
@@ -120,14 +125,19 @@ int task_init(struct worker *worker, struct event *event, int fd) {
 
 // submits a given task to io_uring
 // can be reused to read chunks
-void task_io_submit(struct worker *worker, size_t tid) {
+void task_io_prep_submit(struct worker *worker, size_t tid) {
   struct io_uring_sqe *sqe;
   struct task_hashing *task = &worker->task_slots[tid].as.hashing_task;
   sqe = io_uring_get_sqe(&worker->ring);
   io_uring_prep_read(sqe, task->fd, worker->buffers[tid],
                      sizeof(*worker->buffers), task->offset);
   io_uring_sqe_set_data(sqe, (void *)tid);
+  worker->pending_submits++;
+}
+
+void task_io_submit(struct worker *worker) {
   io_uring_submit(&worker->ring);
+  worker->pending_submits = 0;
 }
 
 void task_free(struct worker *worker, size_t index) {
@@ -137,6 +147,7 @@ void task_free(struct worker *worker, size_t index) {
   close(task->as.hashing_task.fd);
   worker->next_task_slot = index;
   worker->pending_tasks--;
+  worker->available_slots++;
 }
 
 void *worker_run(void *args) {
@@ -154,14 +165,15 @@ void *worker_run(void *args) {
     struct event event;
     bool new_task = false;
 
-    if (worker.pending_tasks == 0) {
+    if (worker.available_slots == worker.nr_tasks) {
       // we have no tasks, block until one is available
       while (queue_consume(&event)) {
         _mm_pause(); // TODO: portability
       }
       new_task = true;
-    } else if (worker.pending_tasks < worker.nr_tasks) {
-      // we have pending tasks, but we can take more, take one
+    } else if (worker.available_slots > 0 &&
+               worker.available_slots < worker.nr_tasks) {
+      // we have available slots to take more
       new_task = (!queue_consume(&event));
     }
 
@@ -173,13 +185,20 @@ void *worker_run(void *args) {
         continue;
       }
       new_task_idx = task_init(&worker, &event, fd);
-      task_io_submit(&worker, new_task_idx);
+      task_io_prep_submit(&worker, new_task_idx);
+      task_io_submit(&worker);
     }
 
-    while (worker.pending_tasks) {
+    if (worker.pending_tasks) {
       struct io_uring_cqe *cqes[worker.nr_tasks];
       size_t i, n;
       n = io_uring_peek_batch_cqe(&worker.ring, cqes, worker.nr_tasks);
+      while (!n && !worker.available_slots) {
+        // when all slots are waiting on CQEs and none is available
+        // pause and retry
+        _mm_pause();
+        n = io_uring_peek_batch_cqe(&worker.ring, cqes, worker.nr_tasks);
+      }
 
       // process completions
       for (i = 0; i < n; i++) {
@@ -196,7 +215,7 @@ void *worker_run(void *args) {
 
           // read next chunk
           task->offset += cqes[i]->res;
-          task_io_submit(&worker, tid);
+          task_io_prep_submit(&worker, tid);
         } else {
           hasher_finalize(&task->hasher, task->hash, sizeof(task->hash));
 
@@ -214,7 +233,8 @@ void *worker_run(void *args) {
           task_free(&worker, tid);
         }
       }
-
+      if (worker.pending_submits)
+        task_io_submit(&worker);
       io_uring_cq_advance(&worker.ring, n);
     }
   }
