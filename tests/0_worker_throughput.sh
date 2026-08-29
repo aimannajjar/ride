@@ -74,9 +74,9 @@ echo "> Drop caches"
 echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
 
 echo "> Start RIDE"
-(sudo "${RIDE}" "$TMP" -t 2 -c 2) > "$TMP"/output.txt &
-PID=$!
+(sudo "$RIDE" "$TMP" -t 4 -c 4) > "${TMP}/output.txt" &
 sleep 0.75
+PID=$(pgrep "ride")
 
 echo "> Simulate highly concurrent reads in background"
 bash "${RIDE_ROOT}/tests/offered_load.sh" "$DUMMY_FILES_N" &
@@ -87,7 +87,7 @@ start=$EPOCHREALTIME
 sleep "$DURATION"
 finish=$EPOCHREALTIME
 echo "> Done!"
-kill $PID
+sudo pkill "$PID"
 
 if (! kill $WORKLAOD_PID); then
   echo "! ERROR: Workload finished earlier than experiment end";

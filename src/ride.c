@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,7 +23,7 @@ struct ride_cli_args {
   size_t io_concurrency;
 };
 
-static volatile bool quit = false;
+atomic_int quit = 0;
 
 /** most args are not actually used
  ** except for filename
@@ -83,7 +84,8 @@ int parse_env(struct ride_cli_args *out, int argc, char *argv[]) {
 }
 
 static void sig_handler(int signal) { 
-  quit = true;
+  atomic_store_explicit(&quit, true, memory_order_release);
+  sleep(1);
 #ifdef USERSPACE_TRACE
   malloc_stats_print(NULL, NULL, NULL);
 #endif
@@ -149,6 +151,8 @@ int ride_run(int argc, char *argv[]) {
   }
 
   signal(SIGINT, sig_handler);
+  signal(SIGTERM, sig_handler);
+  signal(SIGHUP, sig_handler);
   while (!quit) {
     err = ring_buffer__poll(rb, 100);
     if (err < 0 && err != -EINTR) {

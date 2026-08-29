@@ -18,11 +18,11 @@ if [ ! -f "$RIDE" ]; then
 fi
 
 sudo -v
+rm -f "${RIDE_ROOT}/output.txt"
 echo "> Starting RIDE"
 (sudo "$RIDE" "$FIXTURES" -t 2 -c 2) > "${RIDE_ROOT}/output.txt" &
-PID=$!
-# echo "> Started ${PID}; output in ${RIDE_ROOT}/output.txt"
 sleep 0.5;
+PID=$(pgrep "ride")
 
 # simulate reads
 echo "> Simulate reads"
@@ -30,8 +30,9 @@ touch "$FIXTURES"/test1.txt
 touch "$FIXTURES"/test2.txt
 touch "$FIXTURES"/test3.txt
 touch "$FIXTURES"/test4.bin
-sleep 2;
-kill $PID;
+sleep 1;
+sudo kill "$PID"
+sleep 1;
 
 # validate hashes
 echo "> Validate hashes"
@@ -63,5 +64,11 @@ if [[ "$expected" -gt 0 ]]; then
   exit 1
 fi
 
+echo --------------------
+echo "Full RIDE output:"
+cat "${RIDE_ROOT}/output.txt"
+echo --------------------
+
 echo "All tests passed"
+
 
