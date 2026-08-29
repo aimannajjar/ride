@@ -167,7 +167,7 @@ void *worker_run(void *args) {
 
     if (new_task) {
       // we've consumed new task, schedule it in async loop
-      if ((fd = open(event.path, O_RDONLY | O_DIRECT)) < 0) {
+      if ((fd = open(event.path, O_RDONLY)) < 0) {
         // TODO: logging macros
         fprintf(stderr, "Error opening: %s: %s\n", event.path, strerror(errno));
         continue;
