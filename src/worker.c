@@ -7,6 +7,7 @@
 #include <assert.h>
 #include <emmintrin.h>
 #include <fcntl.h>
+#include <jemalloc/jemalloc.h>
 #include <liburing.h>
 #include <stdio.h>
 #include <string.h>
@@ -27,7 +28,7 @@ struct worker {
   // per-task SoAs to keep elements nearby in cache line during async event loop
   unsigned char (*read_buffers)[READ_BUF_SIZE];
   unsigned char (*hashes)[HASH_LEN];
-  char **task_paths;
+  char (*task_paths)[MAX_FILENAME_LEN];
   int *fds;
   off_t *offsets;
   enum task_state *states;
@@ -49,7 +50,8 @@ void worker_setup(struct worker *worker, struct worker_args *wargs) {
   worker->states = malloc(worker->nr_tasks * sizeof(enum task_state));
   worker->hashers = malloc(worker->nr_tasks * sizeof(struct hasher));
   worker->read_buffers =
-      malloc(worker->nr_tasks * sizeof(unsigned char) * READ_BUF_SIZE);
+      mallocx(worker->nr_tasks * sizeof(unsigned char) * READ_BUF_SIZE,
+              MALLOCX_ALIGN(4096));
   worker->task_paths =
       malloc(worker->nr_tasks * sizeof(char) * MAX_FILENAME_LEN);
 
@@ -83,12 +85,12 @@ int task_init(struct worker *worker, struct event *event, int fd) {
   size_t i, my_index;
   assert(worker->states[worker->next_task_idx] == AVAILABLE);
   my_index = worker->next_task_idx;
-  worker->task_paths[my_index] = event->path;
   worker->fds[my_index] = fd;
   worker->offsets[my_index] = 0;
   worker->states[my_index] = READING;
-  memset(worker->read_buffers[my_index], 0, sizeof(worker->read_buffers[0]));
   memset(worker->hashes[my_index], 0, sizeof(worker->hashes[0]));
+  memcpy(worker->task_paths[my_index], event->path,
+         sizeof(worker->task_paths[0]));
   hasher_init(&worker->hashers[my_index]);
   worker->pending_tasks++;
 
@@ -118,9 +120,7 @@ void task_io_submit(struct worker *worker, size_t index) {
 }
 
 void task_free(struct worker *worker, size_t index) {
-  if (worker->task_paths[index])
-    free(worker->task_paths[index]);
-  worker->task_paths[index] = NULL;
+  worker->task_paths[index][0] = '\0';
   worker->states[index] = AVAILABLE;
   worker->next_task_idx = index;
   worker->pending_tasks--;
@@ -138,32 +138,28 @@ void *worker_run(void *args) {
   int new_task_idx;
   while (1) {
     int fd;
-    struct event *event = malloc(sizeof(struct event));
+    struct event event;
     bool new_task = false;
 
     if (worker.pending_tasks == 0) {
       // we have no tasks, block until one is available
-      while (queue_consume(event)) {
+      while (queue_consume(&event)) {
         _mm_pause(); // TODO: portability
       }
       new_task = true;
     } else if (worker.pending_tasks < worker.nr_tasks) {
       // we have pending tasks, but we can take more, take one
-      queue_consume(event);
-      new_task = true;
+      new_task = (!queue_consume(&event));
     }
 
     if (new_task) {
       // we've consumed new task, schedule it in async loop
-      if ((fd = open(event->path, O_RDONLY | O_DIRECT)) < 0) {
+      if ((fd = open(event.path, O_RDONLY | O_DIRECT)) < 0) {
         // TODO: logging macros
-        fprintf(stderr, "Error opening: %s: %s\n", event->path,
-                strerror(errno));
-        free(event);
-        event = NULL;
+        fprintf(stderr, "Error opening: %s: %s\n", event.path, strerror(errno));
         continue;
       }
-      new_task_idx = task_init(&worker, event, fd);
+      new_task_idx = task_init(&worker, &event, fd);
       task_io_submit(&worker, new_task_idx);
     }
 
@@ -178,7 +174,7 @@ void *worker_run(void *args) {
         if (cqes[i]->res < 0) {
           // TODO: logging macros
           fprintf(stderr, "Error async read: %s: %s\n",
-                  worker.task_paths[task_idx], strerror(errno));
+                  worker.task_paths[task_idx], strerror(cqes[i]->res));
           task_free(&worker, task_idx);
           continue;
         } else if (cqes[i]->res > 0) {
@@ -198,9 +194,9 @@ void *worker_run(void *args) {
           mlen = snprintf(debug, 1024,
                           "{ \"worker\": %d, \"file\": \"%s\", \"hash\": \"",
                           worker.id, worker.task_paths[task_idx]);
-          for (i = 0; i < HASH_LEN; i++) {
+          for (int j = 0; j < HASH_LEN; j++) {
             mlen += snprintf(debug + mlen, 512 - mlen, "%02x",
-                             worker.hashes[task_idx][i]);
+                             worker.hashes[task_idx][j]);
           }
           printf("%s\" }\n", debug);
 #endif

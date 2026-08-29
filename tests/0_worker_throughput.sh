@@ -29,13 +29,14 @@ MS=$(echo "scale=2; $DURATION * 1000" | bc)
 SKIP_CORRECTNESS=${3:-0}
 DUMMY_FILES_N=${4:-2000}
 EMPTY_FILES=${5:-0}
-USE_PRE_EXISITNG_DUMMIES=0
+USE_PRE_EXISITNG_DUMMIES=1
 
 if (( ! USE_PRE_EXISITNG_DUMMIES )); then
     rm -rf tmp && mkdir ./tmp
 else
     echo "WARNING: Using existing payloads in tmp/dummy0..${DUMMY_FILES_N}, " \
-          "if files don't exist results will be wrong"
+         "if files don't exist results will be wrong " \
+         "(unset USE_PRE_EXISITNG_DUMMIES to re-generate)"
     rm ./tmp/output.txt
 fi
 
@@ -65,7 +66,7 @@ echo "> Drop caches"
 echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
 
 echo "> Start RIDE"
-(sudo ../build/ride "$PWD"/tmp -t 4 -c 16) > ./tmp/output.txt &
+(sudo ../build/ride "$PWD"/tmp -t 2 -c 2) > ./tmp/output.txt &
 PID=$!
 sleep 0.75
 

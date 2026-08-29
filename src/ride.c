@@ -118,6 +118,8 @@ int ride_run(int argc, char *argv[]) {
   struct ring_buffer *rb;
   int ring_fd;
   int err;
+  
+  queue_init();
 
   obj = ride_bpf__open();
   strncpy(obj->rodata->watch_path, args.watch_path, MAX_FILENAME_LEN);
