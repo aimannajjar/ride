@@ -12,8 +12,9 @@ SKIP_CORRECTNESS=1
 DUMMY_FILES_N=25000
 EMPTY_FILES=0
 
+TESTS_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 for _ in {1..5}; do
-  bash ./0_worker_throughput.sh ${ID} ${DURATION} ${SKIP_CORRECTNESS} ${DUMMY_FILES_N} ${EMPTY_FILES}
+  bash "${TESTS_DIR}"/0_worker_throughput.sh ${ID} ${DURATION} ${SKIP_CORRECTNESS} ${DUMMY_FILES_N} ${EMPTY_FILES}
   sleep 10;
 done
 

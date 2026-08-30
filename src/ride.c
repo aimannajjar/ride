@@ -24,6 +24,7 @@ struct ride_cli_args {
 };
 
 atomic_int quit = 0;
+extern pthread_cond_t queue_cond; // queue.c
 
 /** most args are not actually used
  ** except for filename
@@ -84,7 +85,9 @@ int parse_env(struct ride_cli_args *out, int argc, char *argv[]) {
 }
 
 static void sig_handler(int signal) { 
+  printf("Shutdown signal received, exiting.\n");
   atomic_store_explicit(&quit, true, memory_order_release);
+  pthread_cond_broadcast(&queue_cond);
   sleep(1);
 #ifdef USERSPACE_TRACE
   malloc_stats_print(NULL, NULL, NULL);

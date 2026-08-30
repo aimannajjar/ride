@@ -5,8 +5,6 @@
 
 #define MAX_CONCURRENT_TASKS 256
 
-extern atomic_int quit;
-
 struct worker_args {
   size_t id;
   size_t io_concurrency;

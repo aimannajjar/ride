@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
+set -euo pipefail
 
+cleanup() {
+  sudo kill "$PID" 2>/dev/null || true
+}
 
 ## Quick functional test for smoke testing
 declare -A EXPECTED
@@ -20,6 +24,7 @@ fi
 sudo -v
 rm -f "${RIDE_ROOT}/output.txt"
 echo "> Starting RIDE"
+trap cleanup EXIT
 (sudo "$RIDE" "$FIXTURES" -t 2 -c 2) > "${RIDE_ROOT}/output.txt" &
 sleep 0.5;
 PID=$(pgrep "ride")
@@ -31,7 +36,7 @@ touch "$FIXTURES"/test2.txt
 touch "$FIXTURES"/test3.txt
 touch "$FIXTURES"/test4.bin
 sleep 1;
-sudo kill "$PID"
+sudo kill "$PID" || true
 sleep 1;
 
 # validate hashes

@@ -1,6 +1,7 @@
-#include "ride.h"
 #include "queue.h"
+#include "ride.h"
 #include <emmintrin.h>
+#include <pthread.h>
 #include <stdalign.h>
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -11,22 +12,9 @@ struct spinlock {
   atomic_bool flag;
 };
 
-static inline void spinlock_lock(struct spinlock *lock) {
-  for (;;) {
-    while (atomic_load_explicit(&lock->flag, memory_order_relaxed))
-      _mm_pause();
-
-    bool expected = false;
-    if (atomic_compare_exchange_strong_explicit(&lock->flag, &expected, true,
-                                                memory_order_acquire,
-                                                memory_order_relaxed))
-      return;
-  }
-}
-
-static inline void spinlock_unlock(struct spinlock *lock) {
-  atomic_store_explicit(&lock->flag, false, memory_order_release);
-}
+extern atomic_int quit; // ride.c
+pthread_mutex_t queue_lock = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
 
 struct queue {
   struct event events[QUEUE_SIZE];
@@ -38,34 +26,58 @@ struct queue {
 void queue_init(void) {
   queue.head = 0;
   queue.tail = 0;
-  queue.lock.flag = false;
 }
 
 int queue_add(struct event *event) {
-  spinlock_lock(&queue.lock);
+  pthread_mutex_lock(&queue_lock);
   if (((queue.head + 1) % QUEUE_SIZE) == queue.tail) {
-    spinlock_unlock(&queue.lock);
+    pthread_mutex_unlock(&queue_lock);
     fprintf(stderr, "buffer full\n");
     return 1;
   }
 
   memcpy(&queue.events[queue.head], event, sizeof(struct event));
   queue.head = (queue.head + 1) % QUEUE_SIZE;
-  spinlock_unlock(&queue.lock);
+  pthread_cond_signal(&queue_cond);
+  pthread_mutex_unlock(&queue_lock);
   return 0;
 }
 
-int queue_consume(struct event *event) {
-  spinlock_lock(&queue.lock);
+// attempts to consume, if an item is readily available it returns 0
+// otherwise 1
+int queue_consume_try(struct event *event) {
+  pthread_mutex_lock(&queue_lock);
 
   if (queue.head == queue.tail) {
-    spinlock_unlock(&queue.lock);
+    pthread_mutex_unlock(&queue_lock);
     return 1;
   }
 
   memcpy(event, &queue.events[queue.tail], sizeof(struct event));
   queue.tail = (queue.tail + 1) % QUEUE_SIZE;
 
-  spinlock_unlock(&queue.lock);
+  pthread_mutex_unlock(&queue_lock);
+  return 0;
+}
+
+// blocks when queue is empty
+// unless global flag `quit` is raised, at which point it returns 1
+int queue_consume(struct event *event) {
+  pthread_mutex_lock(&queue_lock);
+
+  while (queue.head == queue.tail &&
+         !atomic_load_explicit(&quit, memory_order_acquire)) {
+    pthread_cond_wait(&queue_cond, &queue_lock);
+  }
+
+  if (quit) {
+    pthread_mutex_unlock(&queue_lock);
+    return 1;
+  }
+
+  memcpy(event, &queue.events[queue.tail], sizeof(struct event));
+  queue.tail = (queue.tail + 1) % QUEUE_SIZE;
+
+  pthread_mutex_unlock(&queue_lock);
   return 0;
 }

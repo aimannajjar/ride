@@ -21,7 +21,13 @@
 #    - minimizes BLAKE3 cost to isolate worker-pipeline throughput
 ##
 
+set -euo pipefail
 ulimit -n 65535
+
+cleanup() {
+  sudo kill "$PID" 2>/dev/null || true
+  kill "$WORKLOAD_PID" 2>/dev/null || true
+}
 
 ID=${1:-1}
 DURATION=${2:-"0.25"}
@@ -74,22 +80,23 @@ echo "> Drop caches"
 echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
 
 echo "> Start RIDE"
-(sudo "$RIDE" "$TMP" -t 4 -c 4) > "${TMP}/output.txt" &
+trap cleanup EXIT
+(sudo "$RIDE" "$TMP" -t 4 -c 32) > "${TMP}/output.txt" &
 sleep 0.75
 PID=$(pgrep "ride")
 
 echo "> Simulate highly concurrent reads in background"
 bash "${RIDE_ROOT}/tests/offered_load.sh" "$DUMMY_FILES_N" &
-WORKLAOD_PID=$!
+WORKLOAD_PID=$!
 
 echo "> Start measuring"
 start=$EPOCHREALTIME
 sleep "$DURATION"
 finish=$EPOCHREALTIME
 echo "> Done!"
-sudo pkill "$PID"
+sudo pkill "$PID" || true
 
-if (! kill $WORKLAOD_PID); then
+if (! kill $WORKLOAD_PID); then
   echo "! ERROR: Workload finished earlier than experiment end";
   exit 1;
 fi
@@ -131,7 +138,6 @@ throughput=$(echo "scale=0; $pass_count/$elapsed" | bc)
 echo
 echo ----------------------------------------
 echo "Test duration: $elapsed seconds"
-echo "Dummy file opens count: ${i}"
 if (( !SKIP_CORRECTNESS )); then
   echo "Correct hashes count: ${pass_count}"
   echo "Wrong hashes count: ${fail_count}"

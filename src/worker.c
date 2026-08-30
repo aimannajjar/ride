@@ -19,6 +19,10 @@
 #define OUTPUT_MAX_SIZE 512
 static_assert(!(READ_BUF_SIZE & (4096 - 1)), "BUFFER SIZE must be 4K aligned");
 
+extern atomic_int quit;            // ride.c
+extern pthread_mutex_t queue_lock; // queue.c
+extern pthread_cond_t queue_cond;  // queue.c
+
 enum task_type {
   HASHING,
   PRINTING,
@@ -88,7 +92,6 @@ void worker_setup(struct worker *worker, struct worker_args *wargs) {
 }
 
 void worker_free(struct worker *worker) {
-  printf("Working %d exiting\n", worker->id);
   free(worker->task_slots);
   free(worker->buffers);
   io_uring_queue_exit(&worker->ring);
@@ -249,16 +252,15 @@ void *worker_run(void *args) {
 
     if (worker.available_slots == worker.nr_tasks) {
       // we have no tasks, block until one is available
-      while (queue_consume(&event)) {
-        _mm_pause(); // TODO: portability
-        if (atomic_load_explicit(&quit, memory_order_acquire))
-          goto done;
+      if (queue_consume(&event)) {
+        // queue_consume returns 1 if quit was rasied while blocking
+        goto done;
       }
       new_task = true;
     } else if (worker.available_slots > 0 &&
                worker.available_slots < worker.nr_tasks) {
       // we have available slots to take more
-      new_task = (!queue_consume(&event));
+      new_task = (!queue_consume_try(&event));
     }
 
     if (new_task) {
