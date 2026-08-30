@@ -25,6 +25,7 @@ struct ride_cli_args {
 };
 
 atomic_int quit = 0;
+extern pthread_mutex_t queue_lock; // queue.c
 extern pthread_cond_t queue_cond; // queue.c
 
 /** most args are not actually used
@@ -85,14 +86,8 @@ int parse_env(struct ride_cli_args *out, int argc, char *argv[]) {
   return 0;
 }
 
-static void ride_sig_handler(int signal) {
-  printf("Shutdown signal received, exiting.\n");
+static void ride_sig_handler([[maybe_unused]] int signal) {
   atomic_store_explicit(&quit, true, memory_order_release);
-  pthread_cond_broadcast(&queue_cond);
-  sleep(1);
-#ifdef USERSPACE_TRACE
-  malloc_stats_print(NULL, NULL, NULL);
-#endif
 }
 
 int ride_ringbuf_handle(void *ctx, void *data, size_t sz) {
@@ -205,12 +200,12 @@ int ride_run(int argc, char *argv[]) {
   ring_fd = bpf_map__fd(obj->maps.rb);
   rb = ring_buffer__new(ring_fd, ride_ringbuf_handle, NULL, NULL);
 
+  pthread_t threads[args.threads];
   for (long i = 0; i < args.threads; i++) {
-    pthread_t thread;
     struct worker_args *wargs = malloc(sizeof(struct worker_args));
     wargs->id = i;
     wargs->io_concurrency = args.io_concurrency;
-    pthread_create(&thread, NULL, &worker_run, (void *)wargs);
+    pthread_create(&threads[i], NULL, &worker_run, (void *)wargs);
   }
 
   if ((err = ride_bpf__attach(obj))) {
@@ -222,7 +217,8 @@ int ride_run(int argc, char *argv[]) {
   signal(SIGINT, ride_sig_handler);
   signal(SIGTERM, ride_sig_handler);
   signal(SIGHUP, ride_sig_handler);
-  while (!quit) {
+
+  while (!atomic_load_explicit(&quit, memory_order_acquire)) {
     err = ring_buffer__poll(rb, 100);
     if (err < 0 && err != -EINTR) {
       perror("ringbuf poll error");
@@ -230,7 +226,22 @@ int ride_run(int argc, char *argv[]) {
     }
   }
 
+  printf("Shutdown signal received, exiting.\n");
+
+  // exit and cleunup
+  pthread_mutex_lock(&queue_lock);
+  pthread_cond_broadcast(&queue_cond);
+  pthread_mutex_unlock(&queue_lock);
+
+  for (size_t i = 0; i <args.threads; i++) {
+    pthread_join(threads[i], NULL);
+  }
+
   ring_buffer__free(rb);
+
+#ifdef USERSPACE_TRACE
+  malloc_stats_print(NULL, NULL, NULL);
+#endif
   if (err)
     return EXIT_FAILURE;
   return EXIT_SUCCESS;

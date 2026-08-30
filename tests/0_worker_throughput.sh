@@ -35,20 +35,35 @@ MS=$(echo "scale=2; $DURATION * 1000" | bc)
 SKIP_CORRECTNESS=${3:-0}
 DUMMY_FILES_N=${4:-2000}
 EMPTY_FILES=${5:-0}
+PERF=${6:-0} # 0 = none, 1 = record, 2 = stat
+
+THREADS=4
+CONCURRENCY=32
+CORES="4,5,6,7,8" # NOTE: cores 0,1,2,3 reserved for load generator
+                  # # of cores should be equal to THREADS + 1 (for main thread)
 USE_PRE_EXISITNG_DUMMIES=1
 
 RIDE_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-RIDE="${RIDE_ROOT}/build/ride"
+RIDE=("${RIDE_ROOT}/build/ride")
 TMP="${RIDE_ROOT}/tests/tmp"
-if [ ! -f "$RIDE" ]; then
+if [ ! -f "${RIDE[0]}" ]; then
   echo "./build/ride was not found, did you build the project?"
   exit 1
+fi
+
+if [[ "${PERF}" -eq 1 ]]; then
+  RIDE=(perf record --no-bpf-event -e "instructions,cycles" -c 10000
+         taskset -c "${CORES}" "${RIDE[0]}")
+elif [[ "${PERF}" -eq 2 ]]; then
+  RIDE=(perf stat taskset -c "${CORES}" "${RIDE[0]}")
+else
+  RIDE=(taskset -c "${CORES}" "${RIDE[0]}")
 fi
 
 if (( ! USE_PRE_EXISITNG_DUMMIES )); then
     rm -rf "$TMP" && mkdir "$TMP"
 else
-    echo "WARNING: Using existing payloads in ${TMP}/dummy0..${DUMMY_FILES_N}, " \
+    echo "WARNING: Using existing payloads in ${TMP}/dummy0-${DUMMY_FILES_N}," \
          "if files don't exist results will be wrong " \
          "(unset USE_PRE_EXISITNG_DUMMIES to re-generate)"
     rm "$TMP"/output.txt
@@ -81,12 +96,14 @@ echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
 
 echo "> Start RIDE"
 trap cleanup EXIT
-(sudo "$RIDE" "$TMP" -t 4 -c 32) > "${TMP}/output.txt" &
+set -x
+(sudo "${RIDE[@]}" "$TMP" -t ${THREADS} -c ${CONCURRENCY}) > "${TMP}/output.txt" &
+set +x
 sleep 0.75
 PID=$(pgrep "ride")
 
 echo "> Simulate highly concurrent reads in background"
-bash "${RIDE_ROOT}/tests/offered_load.sh" "$DUMMY_FILES_N" &
+taskset -c 0,1,2,3 bash "${RIDE_ROOT}/tests/offered_load.sh" "$DUMMY_FILES_N" &
 WORKLOAD_PID=$!
 
 echo "> Start measuring"

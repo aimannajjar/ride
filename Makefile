@@ -1,4 +1,4 @@
-.PHONY: clean
+.PHONY: clean debug perf_record perf_stat
 
 NAME 				:= ride
 BUILD_DIR		:= build
@@ -11,8 +11,18 @@ BPF_CC 			:= clang
 
 all: $(BUILD_DIR)/$(NAME)
 
+debug: clean $(BUILD_DIR)/$(NAME).skel.h 
+	cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
+	cmake --build build
+
+perf_record: $(BUILD_DIR)/$(NAME)
+	bash ./tests/0_perf_record.sh
+
+perf_stat: $(BUILD_DIR)/$(NAME)
+	bash ./tests/0_perf_stat.sh
+
 $(BUILD_DIR)/$(NAME): $(SRCS) $(BUILD_DIR)/$(NAME).skel.h CMakeLists.txt | $(BUILD_DIR)
-	cmake -B build -G Ninja # -DCMAKE_BUILD_TYPE=Debug
+	cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 	cmake --build build
 
 $(BUILD_DIR)/$(NAME).skel.h: $(BPF_OBJS) | $(BUILD_DIR)
@@ -20,6 +30,7 @@ $(BUILD_DIR)/$(NAME).skel.h: $(BPF_OBJS) | $(BUILD_DIR)
 
 $(BPF_OBJS): $(BPF_SRCS) | $(BUILD_DIR)
 	$(BPF_CC) $(BPF_FLAGS) $< -o $@
+
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)

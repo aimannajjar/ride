@@ -12,6 +12,8 @@
     pkgs.bear
     pkgs.b3sum
     pkgs.jq
+    pkgs.perf-tools
+    pkgs.perf
 
     # libs
     pkgs.libbpf

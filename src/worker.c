@@ -220,13 +220,16 @@ void static inline print_hashing_result(struct worker *worker,
                                         struct task_hashing *task) {
   char debug[OUTPUT_MAX_SIZE];
   size_t tid, mlen;
+
   mlen = snprintf(debug, OUTPUT_MAX_SIZE,
                   "{ \"worker\": %d, \"file\": \"%s\", \"hash\": \"",
                   worker->id, task->path);
+  static const char hexdigits[] = "0123456789abcdef";
   for (int j = 0; j < HASH_LEN; j++) {
-    mlen +=
-        snprintf(debug + mlen, OUTPUT_MAX_SIZE - mlen, "%02x", task->hash[j]);
+    debug[mlen++] = hexdigits[task->hash[j] >> 4];
+    debug[mlen++] = hexdigits[task->hash[j] & 0x0f];
   }
+
   mlen += snprintf(debug + mlen, 5, "\" }\n");
 
   // TODO: this should not just assume a task slot is free

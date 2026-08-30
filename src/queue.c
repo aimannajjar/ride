@@ -20,7 +20,6 @@ struct queue {
   struct event events[QUEUE_SIZE];
   int head;
   int tail;
-  alignas(64) struct spinlock lock;
 } queue;
 
 void queue_init(void) {
@@ -65,8 +64,7 @@ int queue_consume_try(struct event *event) {
 int queue_consume(struct event *event) {
   pthread_mutex_lock(&queue_lock);
 
-  while (queue.head == queue.tail &&
-         !atomic_load_explicit(&quit, memory_order_acquire)) {
+  while (queue.head == queue.tail && !quit) {
     pthread_cond_wait(&queue_cond, &queue_lock);
   }
 
