@@ -3,7 +3,7 @@
 #ifndef QUEUE_H
 #define QUEUE_H
 
-#define QUEUE_SIZE 1024
+#define QUEUE_SIZE 2048
 
 void queue_init(void);
 int queue_add(struct event *);

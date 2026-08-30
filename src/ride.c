@@ -2,22 +2,23 @@
 #include "queue.h"
 #include "ride.skel.h"
 #include "worker.h"
-#include <asm-generic/errno-base.h>
-#include <bits/getopt_core.h>
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include <fcntl.h>
+#include <jemalloc/jemalloc.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
-#include <jemalloc/jemalloc.h>
 
 struct ride_cli_args {
-  char watch_path[100];
+  char watch_path[MAX_FILENAME_LEN];
+  size_t watch_path_len;
+  enum watch_path_type watch_path_type;
   char fingerprint_alg[10];
   size_t threads;
   size_t io_concurrency;
@@ -34,7 +35,7 @@ int parse_env(struct ride_cli_args *out, int argc, char *argv[]) {
   //               currenlty only BLAKE3 is supported anyway
   // -t [NUM_THREADS] how many worker threads
   // -c [IO_CONCURRENCY] how many concurrent IO tasks *per* worker thread
-  const char optstring[] = ":f:t:c:";
+  const char optstring[] = ":f::t:c:";
   while (1) {
     int ch = getopt(argc, argv, optstring);
     if (-1 == ch)
@@ -58,7 +59,7 @@ int parse_env(struct ride_cli_args *out, int argc, char *argv[]) {
       break;
     case 'c':
       out->io_concurrency = strtoll(optarg, NULL, 0);
-      if (!out->io_concurrency || out->io_concurrency > MAX_CONCURENCY) {
+      if (!out->io_concurrency || out->io_concurrency > MAX_CONCURRENCY) {
         fprintf(stderr, "Invalid concurrency argument\n");
         return EXIT_FAILURE;
       }
@@ -84,7 +85,7 @@ int parse_env(struct ride_cli_args *out, int argc, char *argv[]) {
   return 0;
 }
 
-static void sig_handler(int signal) { 
+static void ride_sig_handler(int signal) {
   printf("Shutdown signal received, exiting.\n");
   atomic_store_explicit(&quit, true, memory_order_release);
   pthread_cond_broadcast(&queue_cond);
@@ -99,6 +100,71 @@ int ride_ringbuf_handle(void *ctx, void *data, size_t sz) {
   return 0;
 }
 
+int ride_stat(struct ride_cli_args *ride) {
+  struct stat sb;
+  if (stat(ride->watch_path, &sb)) {
+    perror("stat");
+    return 1;
+  }
+
+  if (S_ISDIR(sb.st_mode)) {
+    ride->watch_path_type = WATCH_DIRECRTORY;
+  } else if (S_ISREG(sb.st_mode)) {
+    ride->watch_path_type = WATCH_FILE;
+  } else {
+    fprintf(
+        stderr,
+        "Unsupported watch path (mode=%d). Currently only supporting file or "
+        "directories\n",
+        sb.st_mode);
+    return 1;
+  }
+
+  char *abspath;
+  size_t pathlen;
+  abspath = realpath(ride->watch_path, NULL);
+  if (!abspath) {
+    perror("realpath");
+    return 1;
+  }
+
+  if ((pathlen = strlen(abspath)) > sizeof(ride->watch_path) - 1) {
+    fprintf(stderr, "canonical path is too large: %s\n", abspath);
+    free(abspath);
+    return 1;
+  } else if (ride->watch_path_type == WATCH_DIRECRTORY &&
+             pathlen > sizeof(ride->watch_path) - 2) {
+    // a trailing / will be appeneded to directories, size max is reduced by 1
+    fprintf(stderr,
+            "Watch path too large, please note for directories the max is %d\n",
+            MAX_FILENAME_LEN - 1);
+  }
+
+  strncpy(ride->watch_path, abspath, sizeof(ride->watch_path));
+  ride->watch_path[sizeof(ride->watch_path) - 1] = '\0';
+
+  if (ride->watch_path_type == WATCH_DIRECRTORY) {
+    // append trailing / for directories
+    ride->watch_path[pathlen] = '/';
+    ride->watch_path_len = pathlen + 1;
+
+  } else {
+    ride->watch_path_len = pathlen;
+  }
+  free(abspath);
+
+  if (ride->watch_path_type == WATCH_DIRECRTORY &&
+      ride->watch_path_len > MAX_FILENAME_LEN * 0.90) {
+    fprintf(stderr,
+            "Warning: Watched directory legnth is very large, there is "
+            "a max path of %d. If total path of monitored files exceed "
+            "it, they will be silently dropped\n",
+            MAX_FILENAME_LEN);
+  }
+
+  return 0;
+}
+
 int ride_run(int argc, char *argv[]) {
   struct ride_cli_args args = {.watch_path = {0},
                                .fingerprint_alg = "BLAKE3",
@@ -109,8 +175,7 @@ int ride_run(int argc, char *argv[]) {
     return EXIT_FAILURE;
   }
 
-  if (strlen(args.watch_path) > MAX_FILENAME_LEN) {
-    printf("watch_path too large\n");
+  if (ride_stat(&args)) {
     return EXIT_FAILURE;
   }
 
@@ -123,12 +188,13 @@ int ride_run(int argc, char *argv[]) {
   struct ring_buffer *rb;
   int ring_fd;
   int err;
-  
+
   queue_init();
 
   obj = ride_bpf__open();
   strncpy(obj->rodata->watch_path, args.watch_path, MAX_FILENAME_LEN);
-  obj->rodata->watch_path_len = strlen(args.watch_path);
+  obj->rodata->watch_path_len = args.watch_path_len;
+  obj->rodata->watch_path_type = args.watch_path_type;
   obj->rodata->userspace_pid = getpid();
 
   if ((err = ride_bpf__load(obj))) {
@@ -153,9 +219,9 @@ int ride_run(int argc, char *argv[]) {
     return EXIT_FAILURE;
   }
 
-  signal(SIGINT, sig_handler);
-  signal(SIGTERM, sig_handler);
-  signal(SIGHUP, sig_handler);
+  signal(SIGINT, ride_sig_handler);
+  signal(SIGTERM, ride_sig_handler);
+  signal(SIGHUP, ride_sig_handler);
   while (!quit) {
     err = ring_buffer__poll(rb, 100);
     if (err < 0 && err != -EINTR) {

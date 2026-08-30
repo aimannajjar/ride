@@ -4,19 +4,21 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 
-const volatile char watch_path[MAX_FILENAME_LEN];
-const volatile size_t watch_path_len;
-const volatile pid_t userspace_pid;
-
-#define RINGBUF_SIZE (256 * 1024)
 #define S_IFMT 0170000  /* These bits determine file type.  */
 #define S_IFREG 0100000 /* Regular file.  */
 #define S_ISREG(m) (((m) & S_IFMT) == S_IFREG)
 #define FS_REQUIRES_DEV 1
 
+
+#define RINGBUF_SIZE (MAX_FILENAME_LEN * 1024)
+const volatile char watch_path[MAX_FILENAME_LEN];
+const volatile size_t watch_path_len;
+const volatile enum watch_path_type watch_path_type;
+const volatile pid_t userspace_pid;
+
 struct {
   __uint(type, BPF_MAP_TYPE_RINGBUF);
-  __uint(max_entries, 256 * 1024);
+  __uint(max_entries, RINGBUF_SIZE);
 } rb SEC(".maps");
 
 bool fs_requires_dev(struct super_block *sb) {
@@ -31,8 +33,15 @@ bool in_watch_path(const char *path, int plen) {
 
   int i = 0;
 
-  if (plen < watch_path_len)
+  if (plen < watch_path_len ||
+      (watch_path_type == WATCH_FILE && watch_path_len != plen)) {
+
+#ifdef BPF_DEBUG
+    char fmt[] = "Length mismatch (event<>watch_path): %d <> %d\n";
+    bpf_trace_printk(fmt, sizeof(fmt), plen, watch_path_len);
+#endif
     return false;
+  }
 
   for (i = 0; i < watch_path_len; i++) {
     if (path[i] != watch_path[i])
@@ -58,7 +67,8 @@ int BPF_PROG(ride, struct file *file) {
     return 0;
   }
   int plen = bpf_path_d_path(&file->f_path, ev->path, sizeof(ev->path));
-  ev->path[sizeof(ev->path)-1] = '\0';
+  plen -= 1; // bpf_path_d_path returns size, i.e. nul included, we want length
+  ev->path[sizeof(ev->path) - 1] = '\0';
 
   if (!in_watch_path(ev->path, plen)) {
     bpf_ringbuf_discard(ev, 0);

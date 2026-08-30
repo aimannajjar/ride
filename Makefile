@@ -1,4 +1,4 @@
-.PHONY: cmake clean
+.PHONY: clean
 
 NAME 				:= ride
 BUILD_DIR		:= build
