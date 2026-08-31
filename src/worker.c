@@ -33,6 +33,12 @@ enum task_state {
   PENDING,
 };
 
+struct task_slot {
+  size_t id;
+  struct task_slot *prev;
+  struct task_slot *next;
+};
+
 struct task_hashing {
   unsigned char hash[HASH_LEN];
   unsigned char path[MAX_FILENAME_LEN];
@@ -52,6 +58,7 @@ struct task {
     struct task_hashing hashing_task;
     struct task_printing printing_task;
   } as;
+  struct task_slot *slot;
   enum task_type type;
   enum task_state state;
 };
@@ -63,7 +70,10 @@ struct worker {
 
   unsigned char (*buffers)[READ_BUF_SIZE];
 
-  struct task *task_slots;
+  struct task *tasks;
+  struct task_slot *free_slots;
+  struct task_slot *used_slots;
+  struct task_slot *slots;
   int available_slots;
   int pending_submits;
   int pending_tasks;
@@ -72,28 +82,36 @@ struct worker {
 };
 
 void worker_setup(struct worker *worker, struct worker_args *wargs) {
+  size_t i;
   worker->id = wargs->id;
   worker->pending_tasks = 0;
   worker->pending_submits = 0;
   worker->next_task_slot = 0;
   worker->nr_tasks = wargs->io_concurrency;
   worker->available_slots = worker->nr_tasks;
-  worker->task_slots =
-      mallocx(worker->nr_tasks * sizeof(struct task), MALLOCX_ZERO);
+  worker->tasks = mallocx(worker->nr_tasks * sizeof(struct task), MALLOCX_ZERO);
   worker->buffers =
       aligned_alloc(4096, worker->nr_tasks * sizeof(*worker->buffers));
-  size_t i;
+
+  // initilaize slot lists
+  worker->used_slots = NULL;
+  worker->free_slots = malloc(worker->nr_tasks * sizeof(struct task_slot));
   for (i = 0; i < worker->nr_tasks; i++) {
-    worker->task_slots[i].state = AVAILABLE;
+    worker->tasks[i].state = AVAILABLE;
+    worker->free_slots[i].id = i;
+    worker->free_slots[i].next = &worker->free_slots[i + 1];
   }
+  worker->free_slots[worker->nr_tasks - 1].next = NULL;
+  worker->slots = worker->free_slots;
 
   // setup io_uring
   io_uring_queue_init(worker->nr_tasks, &worker->ring, 0);
 }
 
 void worker_free(struct worker *worker) {
-  free(worker->task_slots);
+  free(worker->tasks);
   free(worker->buffers);
+  free(worker->slots);
   io_uring_queue_exit(&worker->ring);
   fflush(stdout);
   fflush(stderr);
@@ -102,37 +120,42 @@ void worker_free(struct worker *worker) {
 // Performs common bookkeeping for new tasks in worker:
 //  - updates next availble task id
 //  - update available/pending accounts
-//
 int task_init(struct worker *worker) {
-  size_t i, task_slot_idx;
+  size_t tid;
   struct task *task;
-  assert(worker->task_slots[worker->next_task_slot].state == AVAILABLE &&
+  assert(worker->free_slots != NULL &&
          "Bug: assigned task without available task slot");
 
-  task_slot_idx = worker->next_task_slot;
-  task = &worker->task_slots[task_slot_idx];
-  task->state = PENDING;
-
-  worker->available_slots--;
-  worker->pending_tasks++;
-
-  // find next available task
-  if (worker->available_slots > 0) {
-    for (i = 0; i < worker->nr_tasks; i++) {
-      if (worker->task_slots[i].state == AVAILABLE) {
-        worker->next_task_slot = i;
-        return task_slot_idx;
-      }
-    }
-    assert(false && "Bug: available_slots / states discrepancy");
+  // take first free slot, and move head to next one
+  struct task_slot *slot = worker->free_slots;
+  worker->free_slots = worker->free_slots->next;
+  if (worker->free_slots) {
+    worker->free_slots->prev = NULL;
+    if (worker->free_slots->next)
+      worker->free_slots->next->prev = worker->free_slots;
   }
 
-  return task_slot_idx;
+  // move our slot to used list
+  struct task_slot *prev_used = worker->used_slots;
+  worker->used_slots = slot;
+  slot->next = prev_used;
+  slot->prev = NULL;
+  if (prev_used)
+    prev_used->prev = slot;
+
+  // use the acquired slot
+  tid = slot->id;
+  task = &worker->tasks[tid];
+  task->slot = slot;
+  task->state = PENDING;
+  worker->available_slots--;
+  worker->pending_tasks++;
+  return tid;
 }
 
 void task_hashing_prep_submit(struct worker *worker, size_t tid) {
   struct io_uring_sqe *sqe;
-  struct task_hashing *task = &worker->task_slots[tid].as.hashing_task;
+  struct task_hashing *task = &worker->tasks[tid].as.hashing_task;
   sqe = io_uring_get_sqe(&worker->ring);
   io_uring_prep_read(sqe, task->fd, worker->buffers[tid],
                      sizeof(*worker->buffers), task->offset);
@@ -142,7 +165,7 @@ void task_hashing_prep_submit(struct worker *worker, size_t tid) {
 
 void task_printing_prep_submit(struct worker *worker, size_t tid) {
   struct io_uring_sqe *sqe;
-  struct task_printing *task = &worker->task_slots[tid].as.printing_task;
+  struct task_printing *task = &worker->tasks[tid].as.printing_task;
   sqe = io_uring_get_sqe(&worker->ring);
   io_uring_prep_write(sqe, STDOUT_FILENO, task->msg + task->offset,
                       task->len - task->offset, -1);
@@ -166,7 +189,7 @@ int task_hashing_init(struct worker *worker, struct event *event, int fd) {
   struct task *task;
 
   tid = task_init(worker);
-  task = &worker->task_slots[tid];
+  task = &worker->tasks[tid];
   task->as.hashing_task.fd = fd;
   task->as.hashing_task.offset = 0;
   task->type = HASHING;
@@ -183,7 +206,7 @@ int task_printing_init(struct worker *worker, size_t len, char msg[len]) {
   struct task *task;
 
   tid = task_init(worker);
-  task = &worker->task_slots[tid];
+  task = &worker->tasks[tid];
   task->type = PRINTING;
   assert(len < sizeof(task->as.printing_task.msg) &&
          "Bug: async output message too large");
@@ -200,7 +223,7 @@ void task_printing_free(struct task *task) {}
 void task_hashing_free(struct task *task) { close(task->as.hashing_task.fd); }
 
 void task_free(struct worker *worker, size_t tid) {
-  struct task *task = &worker->task_slots[tid];
+  struct task *task = &worker->tasks[tid];
   switch (task->type) {
   case HASHING:
     task_hashing_free(task);
@@ -210,10 +233,59 @@ void task_free(struct worker *worker, size_t tid) {
     break;
   }
 
+  // move slot back to free list
+  struct task_slot *slot, *prior_used_slot, *next_used_slot, *prev_free_head;
+  slot = task->slot;
+
+  // save neighbors in used before moving
+  prior_used_slot = slot->prev;
+  next_used_slot = slot->next;
+
+  // move to free list
+  prev_free_head = worker->free_slots;
+  worker->free_slots = slot;
+  slot->next = prev_free_head;
+  slot->prev = NULL;
+  if (prev_free_head)
+    prev_free_head->prev = slot;
+
+  // stitch the gap in used list
+  if (prior_used_slot) {
+    prior_used_slot->next = next_used_slot;
+    if (next_used_slot)
+      next_used_slot->prev = prior_used_slot;
+  } else {
+    // we were at the front of the list
+    worker->used_slots = next_used_slot;
+    if (next_used_slot)
+      next_used_slot->prev = NULL;
+  }
+
   task->state = AVAILABLE;
-  worker->next_task_slot = tid;
+  task->slot = NULL;
   worker->pending_tasks--;
   worker->available_slots++;
+}
+
+void static inline trace_slot_utilization(struct worker *worker) {
+  struct task_slot *slot;
+  size_t free_count, used_count;
+  slot = worker->free_slots;
+  free_count = 0;
+  while (slot) {
+    free_count++;
+    slot = slot->next;
+  }
+
+  slot = worker->used_slots;
+  used_count = 0;
+  while (slot) {
+    used_count++;
+    slot = slot->next;
+  }
+
+  printf("[SLOT UTILIZATION] Free=%ld; Used=%ld; Ratio=%f\n", free_count,
+         used_count, (used_count / (float)worker->nr_tasks) * 100.0);
 }
 
 void static inline print_hashing_result(struct worker *worker,
@@ -241,6 +313,7 @@ void static inline print_hashing_result(struct worker *worker,
 void *worker_run(void *args) {
   struct worker worker;
   struct worker_args *wargs;
+  size_t counter;
 
   wargs = (struct worker_args *)args;
   worker_setup(&worker, wargs);
@@ -248,6 +321,7 @@ void *worker_run(void *args) {
 
   wargs = NULL;
   int new_task_idx;
+  counter = 0;
   while (!atomic_load_explicit(&quit, memory_order_acquire)) {
     int fd;
     struct event event;
@@ -293,7 +367,7 @@ void *worker_run(void *args) {
       // process completions
       for (i = 0; i < n; i++) {
         size_t tid = (size_t)io_uring_cqe_get_data(cqes[i]);
-        struct task *task = &worker.task_slots[tid];
+        struct task *task = &worker.tasks[tid];
         if (cqes[i]->res < 0) {
           // TODO: logging macros
           switch (task->type) {
@@ -349,6 +423,12 @@ void *worker_run(void *args) {
         task_io_submit(&worker);
       io_uring_cq_advance(&worker.ring, n);
     }
+
+#ifdef USERSPACE_TRACE
+    if ((counter % 10000) == 0)
+      trace_slot_utilization(&worker);
+#endif
+    counter++;
   }
 
 done:

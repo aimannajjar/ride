@@ -25,7 +25,9 @@ sudo -v
 rm -f "${RIDE_ROOT}/output.txt"
 echo "> Starting RIDE"
 trap cleanup EXIT
+set -x
 (sudo "$RIDE" "$FIXTURES" -t 2 -c 2) > "${RIDE_ROOT}/output.txt" &
+set +x
 sleep 0.5;
 PID=$(pgrep "ride")
 
