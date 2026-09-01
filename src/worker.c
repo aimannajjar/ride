@@ -28,14 +28,8 @@ enum task_type {
   PRINTING,
 };
 
-enum task_state {
-  AVAILABLE,
-  PENDING,
-};
-
 struct task_slot {
   size_t id;
-  struct task_slot *prev;
   struct task_slot *next;
 };
 
@@ -60,7 +54,6 @@ struct task {
   } as;
   struct task_slot *slot;
   enum task_type type;
-  enum task_state state;
 };
 
 struct worker {
@@ -72,12 +65,10 @@ struct worker {
 
   struct task *tasks;
   struct task_slot *free_slots;
-  struct task_slot *used_slots;
   struct task_slot *slots;
   int available_slots;
   int pending_submits;
   int pending_tasks;
-  int next_task_slot;
   int id;
 };
 
@@ -86,7 +77,6 @@ void worker_setup(struct worker *worker, struct worker_args *wargs) {
   worker->id = wargs->id;
   worker->pending_tasks = 0;
   worker->pending_submits = 0;
-  worker->next_task_slot = 0;
   worker->nr_tasks = wargs->io_concurrency;
   worker->available_slots = worker->nr_tasks;
   worker->tasks = mallocx(worker->nr_tasks * sizeof(struct task), MALLOCX_ZERO);
@@ -94,15 +84,13 @@ void worker_setup(struct worker *worker, struct worker_args *wargs) {
       aligned_alloc(4096, worker->nr_tasks * sizeof(*worker->buffers));
 
   // initilaize slot lists
-  worker->used_slots = NULL;
-  worker->free_slots = malloc(worker->nr_tasks * sizeof(struct task_slot));
+  worker->slots = malloc(worker->nr_tasks * sizeof(struct task_slot));
   for (i = 0; i < worker->nr_tasks; i++) {
-    worker->tasks[i].state = AVAILABLE;
-    worker->free_slots[i].id = i;
-    worker->free_slots[i].next = &worker->free_slots[i + 1];
+    worker->slots[i].id = i;
+    worker->slots[i].next = &worker->slots[i + 1];
   }
-  worker->free_slots[worker->nr_tasks - 1].next = NULL;
-  worker->slots = worker->free_slots;
+  worker->slots[worker->nr_tasks - 1].next = NULL;
+  worker->free_slots = worker->slots;
 
   // setup io_uring
   io_uring_queue_init(worker->nr_tasks, &worker->ring, 0);
@@ -128,26 +116,12 @@ int task_init(struct worker *worker) {
 
   // take first free slot, and move head to next one
   struct task_slot *slot = worker->free_slots;
-  worker->free_slots = worker->free_slots->next;
-  if (worker->free_slots) {
-    worker->free_slots->prev = NULL;
-    if (worker->free_slots->next)
-      worker->free_slots->next->prev = worker->free_slots;
-  }
-
-  // move our slot to used list
-  struct task_slot *prev_used = worker->used_slots;
-  worker->used_slots = slot;
-  slot->next = prev_used;
-  slot->prev = NULL;
-  if (prev_used)
-    prev_used->prev = slot;
+  worker->free_slots = slot->next;
 
   // use the acquired slot
   tid = slot->id;
   task = &worker->tasks[tid];
   task->slot = slot;
-  task->state = PENDING;
   worker->available_slots--;
   worker->pending_tasks++;
   return tid;
@@ -234,39 +208,19 @@ void task_free(struct worker *worker, size_t tid) {
   }
 
   // move slot back to free list
-  struct task_slot *slot, *prior_used_slot, *next_used_slot, *prev_free_head;
+  struct task_slot *slot, *prev_free_head;
   slot = task->slot;
-
-  // save neighbors in used before moving
-  prior_used_slot = slot->prev;
-  next_used_slot = slot->next;
 
   // move to free list
   prev_free_head = worker->free_slots;
   worker->free_slots = slot;
   slot->next = prev_free_head;
-  slot->prev = NULL;
-  if (prev_free_head)
-    prev_free_head->prev = slot;
-
-  // stitch the gap in used list
-  if (prior_used_slot) {
-    prior_used_slot->next = next_used_slot;
-    if (next_used_slot)
-      next_used_slot->prev = prior_used_slot;
-  } else {
-    // we were at the front of the list
-    worker->used_slots = next_used_slot;
-    if (next_used_slot)
-      next_used_slot->prev = NULL;
-  }
-
-  task->state = AVAILABLE;
   task->slot = NULL;
   worker->pending_tasks--;
   worker->available_slots++;
 }
 
+[[maybe_unused]]
 void static inline trace_slot_utilization(struct worker *worker) {
   struct task_slot *slot;
   size_t free_count, used_count;
@@ -277,13 +231,7 @@ void static inline trace_slot_utilization(struct worker *worker) {
     slot = slot->next;
   }
 
-  slot = worker->used_slots;
-  used_count = 0;
-  while (slot) {
-    used_count++;
-    slot = slot->next;
-  }
-
+  used_count = worker->nr_tasks - free_count;
   printf("[SLOT UTILIZATION] Free=%ld; Used=%ld; Ratio=%f\n", free_count,
          used_count, (used_count / (float)worker->nr_tasks) * 100.0);
 }
@@ -313,7 +261,7 @@ void static inline print_hashing_result(struct worker *worker,
 void *worker_run(void *args) {
   struct worker worker;
   struct worker_args *wargs;
-  size_t counter;
+  [[maybe_unused]] size_t counter = 0;
 
   wargs = (struct worker_args *)args;
   worker_setup(&worker, wargs);
@@ -322,6 +270,7 @@ void *worker_run(void *args) {
   wargs = NULL;
   int new_task_idx;
   counter = 0;
+
   while (!atomic_load_explicit(&quit, memory_order_acquire)) {
     int fd;
     struct event event;
