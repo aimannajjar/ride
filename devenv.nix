@@ -19,6 +19,7 @@
     pkgs.libbpf
     pkgs.liburing
     pkgs.jemalloc
+    pkgs.libclang.lib
 
     # needed to compile bpf programs
     pkgs.linuxHeaders
@@ -31,5 +32,7 @@
   env = {
     LIBBPF = "${pkgs.libbpf}/include";
     LINUX = "${pkgs.linuxHeaders}/include";
+    LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
+    BINDGEN_EXTRA_CLANG_ARGS = "-I${pkgs.glibc.dev}/include";
   };
 }

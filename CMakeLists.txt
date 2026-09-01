@@ -20,6 +20,25 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(blake3)
 
+# Pull libquiche via corrosion
+FetchContent_Declare(
+  corrosion
+  GIT_REPOSITORY https://github.com/corrosion-rs/corrosion.git
+  GIT_TAG v0.6.1
+)
+FetchContent_MakeAvailable(corrosion)
+
+FetchContent_Declare(
+  quiche
+  GIT_REPOSITORY https://github.com/cloudflare/quiche.git
+  GIT_TAG 0.29.3
+)
+FetchContent_MakeAvailable(quiche)
+
+corrosion_import_crate(MANIFEST_PATH ${quiche_SOURCE_DIR}/Cargo.toml
+  FEATURES ffi pkg-config-meta
+  CRATES quiche)
+
 
 file(GLOB_RECURSE SOURCE_FILES 
     src/main.c
@@ -27,9 +46,11 @@ file(GLOB_RECURSE SOURCE_FILES
     src/queue.c
     src/worker.c
     src/hasher.c
+    src/client.c
 )
 
 add_executable(ride ${SOURCE_FILES})
-target_include_directories(ride PRIVATE ${CMAKE_SOURCE_DIR}/build)
-target_link_libraries(ride PRIVATE jemalloc uring blake3 bpf)
+target_include_directories(ride PRIVATE ${CMAKE_SOURCE_DIR}/build
+  ${quiche_SOURCE_DIR}/quiche/include)
+target_link_libraries(ride PRIVATE jemalloc uring blake3 bpf quiche)
 
