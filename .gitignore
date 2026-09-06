@@ -11,8 +11,15 @@ devenv.local.yaml
 
 compile_commands.json
 
-# CMake
+# CMake / Cargo
 build
 .cache
+target
+build-analyze
 
+
+# tmps / testing / perf
 tests/tmp
+pki/
+perf.data
+perf.data.old
