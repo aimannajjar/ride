@@ -1,0 +1,21 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "analyze",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-analyze",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "ENABLE_FANALYZER": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "analyze",
+      "configurePreset": "analyze",
+      "jobs": 8
+    }
+  ]
+}

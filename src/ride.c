@@ -22,6 +22,7 @@ struct ride_cli_args {
   char fingerprint_alg[10];
   size_t threads;
   size_t io_concurrency;
+  bool verify; // TODO: replace with proper verifier config
 };
 
 atomic_int quit = 0;
@@ -36,13 +37,16 @@ static int parse_env(struct ride_cli_args *out, int argc, char *argv[]) {
   //               currenlty only BLAKE3 is supported anyway
   // -t [NUM_THREADS] how many worker threads
   // -c [IO_CONCURRENCY] how many concurrent IO tasks *per* worker thread
-  const char optstring[] = ":f::t:c:";
+  const char optstring[] = ":f::t:c:v";
   while (1) {
     int ch = getopt(argc, argv, optstring);
     if (-1 == ch)
       break;
 
     switch (ch) {
+    case 'v':
+      out->verify = true;
+      break;
     case 'f':
       if (0 != optarg) {
         strncpy(out->fingerprint_alg, optarg, sizeof(out->fingerprint_alg));
@@ -165,6 +169,7 @@ int ride_run(int argc, char *argv[]) {
   struct ride_cli_args args = {.watch_path = {0},
                                .fingerprint_alg = "BLAKE3",
                                .threads = DEFAULT_THREADS,
+                               .verify = false,
                                .io_concurrency = DEFAULT_IO_CONCURRENCY};
 
   if (parse_env(&args, argc, argv)) {
@@ -213,6 +218,7 @@ int ride_run(int argc, char *argv[]) {
       return EXIT_FAILURE;
     }
     wargs->id = i;
+    wargs->verify = args.verify;
     wargs->io_concurrency = args.io_concurrency;
     pthread_create(&threads[i], NULL, &worker_run, (void *)wargs);
   }

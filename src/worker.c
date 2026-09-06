@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include "worker.h"
+#include "client.h"
 #include "hasher.h"
 #include "queue.h"
 #include "ride.h"
@@ -74,7 +75,9 @@ struct task {
 struct worker {
   // io_uring
   struct io_uring ring;
-  size_t nr_tasks;
+
+  // verifier
+  struct client verifier;
 
   // large 4k-aligned buffers indexed by executor (task id)
   unsigned char (*buffers)[READ_BUF_SIZE];
@@ -90,10 +93,10 @@ struct worker {
   int tsp;            // stack pointer for tasks array
 
   // accounting
+  size_t nr_tasks;
   int pending_submits;
-
-  // worker id
   int id;
+  bool verify;
 };
 
 static void worker_setup(struct worker *worker,
@@ -102,8 +105,13 @@ static void worker_setup(struct worker *worker,
   worker->id = wargs->id;
   worker->pending_submits = 0;
   worker->nr_tasks = wargs->io_concurrency;
+  worker->verify = wargs->verify;
   worker->buffers =
       aligned_alloc(4096, worker->nr_tasks * sizeof(*worker->buffers));
+
+  // initialize verifier
+  if (worker->verify)
+    client_init(&worker->verifier);
 
   // initialize tasks satck
   worker->tsp = 0;
@@ -346,6 +354,10 @@ void *worker_run(void *args) {
 
       enqueue_job_hashing(&worker, &event, fd);
     }
+
+    // verifier tasks
+    if (worker.verify)
+      client_advance(&worker.verifier);
 
     // Take a task
     struct task *task;
