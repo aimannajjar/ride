@@ -26,12 +26,12 @@ struct ride_cli_args {
 
 atomic_int quit = 0;
 extern pthread_mutex_t queue_lock; // queue.c
-extern pthread_cond_t queue_cond; // queue.c
+extern pthread_cond_t queue_cond;  // queue.c
 
 /** most args are not actually used
  ** except for filename
  **/
-int parse_env(struct ride_cli_args *out, int argc, char *argv[]) {
+static int parse_env(struct ride_cli_args *out, int argc, char *argv[]) {
   // -f [FP_ALG] = use fingerprinting, specify algorithm or defaults to BLAKE3
   //               currenlty only BLAKE3 is supported anyway
   // -t [NUM_THREADS] how many worker threads
@@ -90,12 +90,12 @@ static void ride_sig_handler([[maybe_unused]] int signal) {
   atomic_store_explicit(&quit, true, memory_order_release);
 }
 
-int ride_ringbuf_handle(void *ctx, void *data, size_t sz) {
+static int ride_ringbuf_handle(void *ctx, void *data, size_t sz) {
   queue_add((struct event *)data);
   return 0;
 }
 
-int ride_stat(struct ride_cli_args *ride) {
+static int ride_stat(struct ride_cli_args *ride) {
   struct stat sb;
   if (stat(ride->watch_path, &sb)) {
     perror("stat");
@@ -160,6 +160,7 @@ int ride_stat(struct ride_cli_args *ride) {
   return 0;
 }
 
+// cppcheck-suppress unusedFunction
 int ride_run(int argc, char *argv[]) {
   struct ride_cli_args args = {.watch_path = {0},
                                .fingerprint_alg = "BLAKE3",
@@ -174,8 +175,8 @@ int ride_run(int argc, char *argv[]) {
     return EXIT_FAILURE;
   }
 
-  printf("Starting RIDE with watch_path=%s, fp=%s, threads=%ld, "
-         "io_concurrency=%ld\n",
+  printf("Starting RIDE with watch_path=%s, fp=%s, threads=%zu, "
+         "io_concurrency=%zu\n",
          args.watch_path, args.fingerprint_alg, args.threads,
          args.io_concurrency);
 
@@ -187,6 +188,10 @@ int ride_run(int argc, char *argv[]) {
   queue_init();
 
   obj = ride_bpf__open();
+  if (!obj) {
+    fprintf(stderr, "bpf open error: %s\n", strerror(-errno));
+    return EXIT_FAILURE;
+  }
   strncpy(obj->rodata->watch_path, args.watch_path, MAX_FILENAME_LEN);
   obj->rodata->watch_path_len = args.watch_path_len;
   obj->rodata->watch_path_type = args.watch_path_type;
@@ -203,6 +208,10 @@ int ride_run(int argc, char *argv[]) {
   pthread_t threads[args.threads];
   for (long i = 0; i < args.threads; i++) {
     struct worker_args *wargs = malloc(sizeof(struct worker_args));
+    if (!wargs) {
+      perror("malloc");
+      return EXIT_FAILURE;
+    }
     wargs->id = i;
     wargs->io_concurrency = args.io_concurrency;
     pthread_create(&threads[i], NULL, &worker_run, (void *)wargs);
@@ -233,7 +242,7 @@ int ride_run(int argc, char *argv[]) {
   pthread_cond_broadcast(&queue_cond);
   pthread_mutex_unlock(&queue_lock);
 
-  for (size_t i = 0; i <args.threads; i++) {
+  for (size_t i = 0; i < args.threads; i++) {
     pthread_join(threads[i], NULL);
   }
 

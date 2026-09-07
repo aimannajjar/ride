@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 4.1)
 project(ride 
   LANGUAGES C CXX
   VERSION 0.0.1
-  DESCRIPTION "RIDES - Real-time Intrusion Detection Events System"
+  DESCRIPTION "RIDE - Real-time Intrusion Detection Events"
 )
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -39,6 +39,21 @@ corrosion_import_crate(MANIFEST_PATH ${quiche_SOURCE_DIR}/Cargo.toml
   FEATURES ffi pkg-config-meta
   CRATES quiche)
 
+## Enable static analyzer
+option(ENABLE_FANALYZER "Enable -fanalyzer")
+if (ENABLE_FANALYZER)
+  add_compile_options(-fanalyzer)
+
+  # cppcheck
+  find_program(CPPCHECK cppcheck)
+  set(CMAKE_C_CPPCHECK ${CPPCHECK}
+    --enable=all
+    --inconclusive
+    --quiet
+    -i ${CMAKE_BINARY_DIR} # skip auto-generated ride.skel.h
+    --suppress=missingIncludeSystem
+  )
+endif()
 
 file(GLOB_RECURSE SOURCE_FILES 
     src/main.c

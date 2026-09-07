@@ -10,6 +10,6 @@ struct worker_args {
   size_t io_concurrency;
 };
 
-void *worker_run(void *);
+void *worker_run(void *args);
 
 #endif // WORKER_H

@@ -14,6 +14,7 @@
     pkgs.jq
     pkgs.perf-tools
     pkgs.perf
+    pkgs.cppcheck
 
     # libs
     pkgs.libbpf

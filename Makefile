@@ -1,4 +1,4 @@
-.PHONY: clean debug perf_record perf_stat
+.PHONY: clean analyze debug perf_record perf_stat
 
 NAME 				:= ride
 BUILD_DIR		:= build
@@ -11,7 +11,11 @@ BPF_CC 			:= clang
 
 all: $(BUILD_DIR)/$(NAME)
 
-debug: clean $(BUILD_DIR)/$(NAME).skel.h 
+analyze: $(BUILD_DIR)/$(NAME).skel.h $(SRCS)
+	cmake --preset analyze
+	cmake --build --preset analyze
+
+debug: $(BUILD_DIR)/$(NAME).skel.h 
 	cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
 	cmake --build build
 
