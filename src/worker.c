@@ -17,6 +17,8 @@
 
 #define READ_BUF_SIZE 65536
 #define OUTPUT_MAX_SIZE 512
+#define JOB_QUEUE_DEPTH 128 // TODO: make run-time configurable
+
 static_assert(!(READ_BUF_SIZE & (4096 - 1)), "BUFFER SIZE must be 4K aligned");
 
 extern atomic_int quit;            // ride.c
@@ -28,12 +30,8 @@ enum task_type {
   PRINTING,
 };
 
-struct task_slot {
-  size_t id;
-  struct task_slot *next;
-};
-
-struct task_hashing {
+// encodes parameters specific to hashing jobs
+struct job_hashing {
   unsigned char hash[HASH_LEN];
   unsigned char path[MAX_FILENAME_LEN];
   struct hasher hasher;
@@ -41,19 +39,36 @@ struct task_hashing {
   int fd;
 };
 
-struct task_printing {
+// encodes parameters specific to printing jobs
+struct job_printing {
   unsigned char msg[OUTPUT_MAX_SIZE];
   size_t len;
   off_t offset;
 };
 
-struct task {
+// This struct contain the actual specification
+// of job to execute, with union used for type-punning
+// into specific specs for various kinds of jobs
+struct job {
   union {
-    struct task_hashing hashing_task;
-    struct task_printing printing_task;
+    struct job_hashing hashing_job;
+    struct job_printing printing_job;
   } as;
-  struct task_slot *slot;
+  struct job_slot *slot;
   enum task_type type;
+  size_t id;
+};
+
+// This represents a slot in free/queued jobs list
+// each slot points to a job spec, i.e. struct job
+struct job_slot {
+  struct job job;
+  struct job_slot *next;
+};
+
+struct task {
+  struct job_slot *job_slot;
+  size_t id;
 };
 
 struct worker {
@@ -61,42 +76,58 @@ struct worker {
   struct io_uring ring;
   size_t nr_tasks;
 
+  // large 4k-aligned buffers indexed by executor (task id)
   unsigned char (*buffers)[READ_BUF_SIZE];
 
-  struct task *tasks;
-  struct task_slot *free_slots;
-  struct task_slot *slots;
-  int available_slots;
+  // jobs
+  struct job_slot *free_slots;   // slots are used to schedule jobs
+  struct job_slot *queued_slots; // slots that have been scheduled
+  struct job_slot *slots;        // unmodified pointer to use for freeing above
+
+  // task (executors)
+  struct task *tasks; // represents a task currently in execution
+  int *free_tids;     // stack of currently unused executors in tasks list
+  int tsp;            // stack pointer for tasks array
+
+  // accounting
   int pending_submits;
-  int pending_tasks;
+
+  // worker id
   int id;
 };
 
-void worker_setup(struct worker *worker, struct worker_args *wargs) {
-  size_t i;
+static void worker_setup(struct worker *worker,
+                         const struct worker_args *wargs) {
+  ssize_t i;
   worker->id = wargs->id;
-  worker->pending_tasks = 0;
   worker->pending_submits = 0;
   worker->nr_tasks = wargs->io_concurrency;
-  worker->available_slots = worker->nr_tasks;
-  worker->tasks = mallocx(worker->nr_tasks * sizeof(struct task), MALLOCX_ZERO);
   worker->buffers =
       aligned_alloc(4096, worker->nr_tasks * sizeof(*worker->buffers));
 
-  // initilaize slot lists
-  worker->slots = malloc(worker->nr_tasks * sizeof(struct task_slot));
+  // initialize tasks satck
+  worker->tsp = 0;
+  worker->tasks = mallocx(worker->nr_tasks * sizeof(struct job), MALLOCX_ZERO);
+  worker->free_tids = malloc(worker->nr_tasks * sizeof(*worker->free_tids));
   for (i = 0; i < worker->nr_tasks; i++) {
-    worker->slots[i].id = i;
+    worker->tasks[i].id = i;
+    worker->free_tids[i] = i;
+  }
+
+  // initilaize jobs lists
+  worker->slots = malloc(JOB_QUEUE_DEPTH * sizeof(struct job_slot));
+  worker->slots[JOB_QUEUE_DEPTH - 1].next = NULL;
+  for (i = JOB_QUEUE_DEPTH - 2; i >= 0; i--) {
     worker->slots[i].next = &worker->slots[i + 1];
   }
-  worker->slots[worker->nr_tasks - 1].next = NULL;
   worker->free_slots = worker->slots;
+  worker->queued_slots = NULL;
 
   // setup io_uring
   io_uring_queue_init(worker->nr_tasks, &worker->ring, 0);
 }
 
-void worker_free(struct worker *worker) {
+static void worker_free(struct worker *worker) {
   free(worker->tasks);
   free(worker->buffers);
   free(worker->slots);
@@ -108,121 +139,139 @@ void worker_free(struct worker *worker) {
 // Performs common bookkeeping for new tasks in worker:
 //  - updates next availble task id
 //  - update available/pending accounts
-int task_init(struct worker *worker) {
+static struct task *task_take(struct worker *worker) {
   size_t tid;
+  struct job_slot *job_slot;
   struct task *task;
-  assert(worker->free_slots != NULL &&
-         "Bug: assigned task without available task slot");
 
-  // take first free slot, and move head to next one
-  struct task_slot *slot = worker->free_slots;
-  worker->free_slots = slot->next;
+  if (worker->tsp == worker->nr_tasks) {
+    fprintf(stderr, "not enough executors\n");
+    return NULL;
+  }
 
-  // use the acquired slot
-  tid = slot->id;
+  // take first free scheduled job, and move head to next one
+  job_slot = worker->queued_slots;
+  if (!job_slot)
+    return NULL; // nothing is scheduled
+
+  worker->queued_slots = worker->queued_slots->next;
+
+  tid = worker->free_tids[worker->tsp++];
   task = &worker->tasks[tid];
-  task->slot = slot;
-  worker->available_slots--;
-  worker->pending_tasks++;
-  return tid;
+  task->job_slot = job_slot;
+  return task;
 }
 
-void task_hashing_prep_submit(struct worker *worker, size_t tid) {
+static void task_hashing_prep_submit(struct worker *worker, struct task *task) {
   struct io_uring_sqe *sqe;
-  struct task_hashing *task = &worker->tasks[tid].as.hashing_task;
+  struct job *job = &task->job_slot->job;
+  struct job_hashing *hjob = &job->as.hashing_job;
   sqe = io_uring_get_sqe(&worker->ring);
-  io_uring_prep_read(sqe, task->fd, worker->buffers[tid],
-                     sizeof(*worker->buffers), task->offset);
-  io_uring_sqe_set_data(sqe, (void *)tid);
+  io_uring_prep_read(sqe, hjob->fd, worker->buffers[job->id],
+                     sizeof(*worker->buffers), hjob->offset);
+  io_uring_sqe_set_data(sqe, (void *)task);
   worker->pending_submits++;
 }
 
-void task_printing_prep_submit(struct worker *worker, size_t tid) {
+static void task_printing_prep_submit(struct worker *worker,
+                                      struct task *task) {
   struct io_uring_sqe *sqe;
-  struct task_printing *task = &worker->tasks[tid].as.printing_task;
+  struct job *job = &task->job_slot->job;
+  const struct job_printing *pjob = &job->as.printing_job;
   sqe = io_uring_get_sqe(&worker->ring);
-  io_uring_prep_write(sqe, STDOUT_FILENO, task->msg + task->offset,
-                      task->len - task->offset, -1);
-  io_uring_sqe_set_data(sqe, (void *)tid);
+  io_uring_prep_write(sqe, STDOUT_FILENO, pjob->msg + pjob->offset,
+                      pjob->len - pjob->offset, -1);
+  io_uring_sqe_set_data(sqe, (void *)task);
   worker->pending_submits++;
 }
 
-void task_io_submit(struct worker *worker) {
-  io_uring_submit(&worker->ring);
+static void task_io_submissions_flush(struct worker *worker) {
+  if (worker->pending_submits)
+    io_uring_submit(&worker->ring);
   worker->pending_submits = 0;
 }
 
-// Performs initialization of new hashing io task
-//  - calls base task_init()
-//  - initialize buffers
-//  - initialize hasher
-// struct event must be on the heap
-// actual task submission to io_uring is done in task_io_submit
-int task_hashing_init(struct worker *worker, struct event *event, int fd) {
-  size_t tid;
-  struct task *task;
+static struct job_slot *enqueue_job(struct worker *worker) {
+  // take first available slot and move head
+  struct job_slot *job_slot;
+  job_slot = worker->free_slots;
+  worker->free_slots = worker->free_slots->next;
 
-  tid = task_init(worker);
-  task = &worker->tasks[tid];
-  task->as.hashing_task.fd = fd;
-  task->as.hashing_task.offset = 0;
-  task->type = HASHING;
-  memset(task->as.hashing_task.hash, 0, sizeof(task->as.hashing_task.hash));
-  memcpy(task->as.hashing_task.path, event->path,
-         sizeof(task->as.hashing_task.path));
-  hasher_init(&task->as.hashing_task.hasher);
-  return tid;
+  // enqueue taken slot in scheduled queue (TODO: consider impact of LIFO)
+  job_slot->next = worker->queued_slots;
+  worker->queued_slots = job_slot;
+  return job_slot;
+}
+
+static void enqueue_job_hashing(struct worker *worker,
+                                const struct event *event, int fd) {
+  struct job_slot *job_slot;
+  struct job *job;
+
+  job_slot = enqueue_job(worker);
+  job = &job_slot->job;
+
+  // populate job
+  job->as.hashing_job.fd = fd;
+  job->as.hashing_job.offset = 0;
+  job->type = HASHING;
+  memset(job->as.hashing_job.hash, 0, sizeof(job->as.hashing_job.hash));
+  memcpy(job->as.hashing_job.path, event->path,
+         sizeof(job->as.hashing_job.path));
+  hasher_init(&job->as.hashing_job.hasher);
 }
 
 // Performs initialization of new printing io task
-int task_printing_init(struct worker *worker, size_t len, char msg[len]) {
-  size_t tid;
-  struct task *task;
+static void enqueue_job_printing(struct worker *worker, size_t len,
+                                 const char msg[len]) {
+  struct job_slot *job_slot;
+  struct job *job;
 
-  tid = task_init(worker);
-  task = &worker->tasks[tid];
-  task->type = PRINTING;
-  assert(len < sizeof(task->as.printing_task.msg) &&
+  job_slot = enqueue_job(worker);
+  job = &job_slot->job;
+
+  // populate job
+  job->type = PRINTING;
+  assert(len < sizeof(job->as.printing_job.msg) &&
          "Bug: async output message too large");
-  strncpy((char *)task->as.printing_task.msg, msg,
-          sizeof(task->as.printing_task.msg));
-  task->as.printing_task.msg[sizeof(task->as.printing_task.msg) - 1] = '\0';
-  task->as.printing_task.len = len;
-  task->as.printing_task.offset = 0;
-  return tid;
+  strncpy((char *)job->as.printing_job.msg, msg,
+          sizeof(job->as.printing_job.msg));
+  job->as.printing_job.msg[sizeof(job->as.printing_job.msg) - 1] = '\0';
+  job->as.printing_job.len = len;
+  job->as.printing_job.offset = 0;
 }
 
-void task_printing_free(struct task *task) {}
+static void job_printing_free(const struct job *job) {}
 
-void task_hashing_free(struct task *task) { close(task->as.hashing_task.fd); }
+static void job_hashing_free(struct job *job) { close(job->as.hashing_job.fd); }
 
-void task_free(struct worker *worker, size_t tid) {
-  struct task *task = &worker->tasks[tid];
-  switch (task->type) {
+static void task_free(struct worker *worker, struct task *task) {
+  struct job_slot *job_slot;
+  struct job *job;
+
+  job_slot = task->job_slot;
+  job = &task->job_slot->job;
+  switch (job->type) {
   case HASHING:
-    task_hashing_free(task);
+    job_hashing_free(job);
     break;
   case PRINTING:
-    task_printing_free(task);
+    job_printing_free(job);
     break;
   }
 
   // move slot back to free list
-  struct task_slot *slot, *prev_free_head;
-  slot = task->slot;
+  job_slot->next = worker->free_slots;
+  worker->free_slots = job_slot;
 
-  // move to free list
-  prev_free_head = worker->free_slots;
-  worker->free_slots = slot;
-  slot->next = prev_free_head;
-  task->slot = NULL;
-  worker->pending_tasks--;
-  worker->available_slots++;
+  // free up task executor and push its id to stack
+  task->job_slot = NULL;
+  worker->free_tids[--worker->tsp] = task->id;
 }
 
 [[maybe_unused]]
-void static inline trace_slot_utilization(struct worker *worker) {
-  struct task_slot *slot;
+void static inline trace_slot_utilization(const struct worker *worker) {
+  const struct job_slot *slot;
   size_t free_count, used_count;
   slot = worker->free_slots;
   free_count = 0;
@@ -232,32 +281,34 @@ void static inline trace_slot_utilization(struct worker *worker) {
   }
 
   used_count = worker->nr_tasks - free_count;
-  printf("[SLOT UTILIZATION] Free=%ld; Used=%ld; Ratio=%f\n", free_count,
+  printf("[SLOT UTILIZATION] Free=%zu; Used=%zu; Ratio=%f\n", free_count,
          used_count, (used_count / (float)worker->nr_tasks) * 100.0);
 }
 
 void static inline print_hashing_result(struct worker *worker,
-                                        struct task_hashing *task) {
+                                        const struct job_hashing *htask) {
   char debug[OUTPUT_MAX_SIZE];
-  size_t tid, mlen;
+  size_t mlen;
 
   mlen = snprintf(debug, OUTPUT_MAX_SIZE,
                   "{ \"worker\": %d, \"file\": \"%s\", \"hash\": \"",
-                  worker->id, task->path);
+                  worker->id, htask->path);
   static const char hexdigits[] = "0123456789abcdef";
   for (int j = 0; j < HASH_LEN; j++) {
-    debug[mlen++] = hexdigits[task->hash[j] >> 4];
-    debug[mlen++] = hexdigits[task->hash[j] & 0x0f];
+    debug[mlen++] = hexdigits[htask->hash[j] >> 4];
+    debug[mlen++] = hexdigits[htask->hash[j] & 0x0f];
   }
 
   mlen += snprintf(debug + mlen, 5, "\" }\n");
 
-  // TODO: this should not just assume a task slot is free
-  // need enqueuing mechaism
-  tid = task_printing_init(worker, mlen, debug);
-  task_printing_prep_submit(worker, tid);
+  enqueue_job_printing(worker, mlen, debug);
 }
 
+static bool have_work(const struct worker *worker) {
+  return worker->tsp > 0 || worker->queued_slots;
+}
+
+// cppcheck-suppress unusedFunction
 void *worker_run(void *args) {
   struct worker worker;
   struct worker_args *wargs;
@@ -266,112 +317,115 @@ void *worker_run(void *args) {
   wargs = (struct worker_args *)args;
   worker_setup(&worker, wargs);
   free(wargs);
-
   wargs = NULL;
-  int new_task_idx;
-  counter = 0;
 
+  counter = 0;
   while (!atomic_load_explicit(&quit, memory_order_acquire)) {
     int fd;
     struct event event;
-    bool new_task = false;
+    bool new_file_event = false;
 
-    if (worker.available_slots == worker.nr_tasks) {
+    if (!have_work(&worker)) {
       // we have no tasks, block until one is available
       if (queue_consume(&event)) {
         // queue_consume returns 1 if quit was rasied while blocking
         goto done;
       }
-      new_task = true;
-    } else if (worker.available_slots > 0 &&
-               worker.available_slots < worker.nr_tasks) {
-      // we have available slots to take more
-      new_task = (!queue_consume_try(&event));
+      new_file_event = true;
+    } else if (worker.tsp > 0 && worker.tsp < worker.nr_tasks) {
+      new_file_event = (!queue_consume_try(&event));
     }
 
-    if (new_task) {
+    if (new_file_event) {
       // we've consumed new task, schedule it in async loop
       if ((fd = open(event.path, O_RDONLY)) < 0) {
         // TODO: logging macros
         fprintf(stderr, "Error opening: %s: %s\n", event.path, strerror(errno));
         continue;
       }
-      // queue tasks are always hashing kind (so far)
-      new_task_idx = task_hashing_init(&worker, &event, fd);
-      task_hashing_prep_submit(&worker, new_task_idx);
-      task_io_submit(&worker);
+
+      enqueue_job_hashing(&worker, &event, fd);
     }
 
-    if (worker.pending_tasks) {
-      struct io_uring_cqe *cqes[worker.nr_tasks];
-      size_t i, n;
-      n = io_uring_peek_batch_cqe(&worker.ring, cqes, worker.nr_tasks);
-      while (!n && !worker.available_slots) {
-        // when all slots are waiting on CQEs and none is available
-        // pause and retry
-        _mm_pause();
-        n = io_uring_peek_batch_cqe(&worker.ring, cqes, worker.nr_tasks);
+    // Take a task
+    struct task *task;
+    const struct job *job;
+    if ((task = task_take(&worker))) {
+      job = &task->job_slot->job;
+      switch (job->type) {
+      case HASHING:
+        task_hashing_prep_submit(&worker, task);
+        task_io_submissions_flush(&worker);
+        break;
+      case PRINTING:
+        task_printing_prep_submit(&worker, task);
       }
+    }
 
-      // process completions
-      for (i = 0; i < n; i++) {
-        size_t tid = (size_t)io_uring_cqe_get_data(cqes[i]);
-        struct task *task = &worker.tasks[tid];
-        if (cqes[i]->res < 0) {
-          // TODO: logging macros
-          switch (task->type) {
-          case HASHING:
-            fprintf(stderr, "(slot %ld) Error async read: %s: %s\n", tid,
-                    task->as.hashing_task.path, strerror(-cqes[i]->res));
-            break;
-          case PRINTING:
-            // todo: PRINTING errors
-            break;
-          }
-          task_free(&worker, tid);
-          continue;
-        } else if (cqes[i]->res > 0) {
-          switch (task->type) {
-          case HASHING:
-            hasher_update(&task->as.hashing_task.hasher, cqes[i]->res,
-                          worker.buffers[tid]);
+    // process io_uring completions if any
+    struct io_uring_cqe *cqes[worker.nr_tasks];
+    size_t i, n;
+    n = io_uring_peek_batch_cqe(&worker.ring, cqes, worker.nr_tasks);
+    while (!n && worker.tsp == worker.nr_tasks) {
+      // when all task executors are waiting on CQEs and none is available
+      // block until we are able to make progress
+      _mm_pause(); // TODO: portability
+      n = io_uring_peek_batch_cqe(&worker.ring, cqes, worker.nr_tasks);
+    }
 
-            // read next chunk
-            task->as.hashing_task.offset += cqes[i]->res;
-            task_hashing_prep_submit(&worker, tid);
-            break;
-          case PRINTING:
-            task->as.printing_task.offset += cqes[i]->res;
-            task_printing_prep_submit(&worker, tid);
-            break;
-          }
-        } else {
-          // final completion
-          switch (task->type) {
-          case HASHING:
-            hasher_finalize(&task->as.hashing_task.hasher,
-                            task->as.hashing_task.hash,
-                            sizeof(task->as.hashing_task.hash));
+    // process completions
+    for (i = 0; i < n; i++) {
+      struct task *itask = (struct task *)io_uring_cqe_get_data(cqes[i]);
+      struct job *ijob = &itask->job_slot->job;
+      if (cqes[i]->res < 0) {
+        // TODO: logging macros
+        switch (ijob->type) {
+        case HASHING:
+          fprintf(stderr, "(slot %zu) Error async read: %s: %s\n", itask->id,
+                  ijob->as.hashing_job.path, strerror(-cqes[i]->res));
+          break;
+        case PRINTING:
+          // todo: PRINTING errors
+          break;
+        }
+        task_free(&worker, itask);
+        continue;
+      } else if (cqes[i]->res > 0) {
+        switch (ijob->type) {
+        case HASHING:
+          hasher_update(&ijob->as.hashing_job.hasher, cqes[i]->res,
+                        worker.buffers[itask->id]);
 
-            task_free(&worker, tid);
+          // read next chunk
+          ijob->as.hashing_job.offset += cqes[i]->res;
+          task_hashing_prep_submit(&worker, itask);
+          break;
+        case PRINTING:
+          ijob->as.printing_job.offset += cqes[i]->res;
+          task_printing_prep_submit(&worker, itask);
+          break;
+        }
+      } else {
+        // final completion
+        switch (ijob->type) {
+        case HASHING:
+          hasher_finalize(&ijob->as.hashing_job.hasher,
+                          ijob->as.hashing_job.hash,
+                          sizeof(ijob->as.hashing_job.hash));
 
-            // TODO
-            // fragile - ref hashing_task after freeing to ensure availble slot
-            // restructure after implementing queuing mechanism
-            // works now because free doesn't touch hash result (it resets at
-            // init)
-            print_hashing_result(&worker, &task->as.hashing_task);
-            break;
-          case PRINTING:
-            task_free(&worker, tid);
-            break;
-          }
+          task_free(&worker, itask);
+
+          print_hashing_result(&worker, &ijob->as.hashing_job);
+          break;
+        case PRINTING:
+          task_free(&worker, itask);
+          break;
         }
       }
-      if (worker.pending_submits)
-        task_io_submit(&worker);
-      io_uring_cq_advance(&worker.ring, n);
     }
+
+    task_io_submissions_flush(&worker);
+    io_uring_cq_advance(&worker.ring, n);
 
 #ifdef USERSPACE_TRACE
     if ((counter % 10000) == 0)
