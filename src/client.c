@@ -1,10 +1,13 @@
-#include <asm-generic/errno.h>
+#include "client.h"
+#include "ride.h"
+#include "worker.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
 #include <pthread.h>
 #include <quiche.h>
 #include <stdatomic.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,29 +15,17 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include <sys/epoll.h>
-
 static pthread_mutex_t mutex;
 static struct addrinfo *remote_addr;
 
 #define RIDE_ALPN "\x07ride0.1"
 #define RIDE_ALPN_LEN 8
 
-struct client {
-  // quiche structs
-  quiche_conn *quiche_conn;
-  quiche_config *quiche_config;
-
-  // socket addresses
-  struct sockaddr_storage local_addr;
-  struct sockaddr remote_addr;
-  socklen_t remote_addr_len;
-  socklen_t local_addr_len;
-
-  // conn/sock id
-  uint8_t scid[16];
-  int sock_fd;
-};
+struct verifier_config client_verifier_config() {
+  return (struct verifier_config){
+      .requires_background_job = true,
+  };
+}
 
 void init_addr() {
   pthread_mutex_lock(&mutex);
@@ -99,6 +90,7 @@ int client_receive(struct client *client) {
   n = quiche_conn_recv(client->quiche_conn, buf, n, &info);
   if (n < 0)
     return n;
+  printf("received %zd bytes\n", n);
   return 0;
 }
 
@@ -132,13 +124,26 @@ static int client_new_quiche_conn(struct client *client) {
   return 0;
 }
 
-void client_init(struct client *client) {
+uint64_t client_advance(void *arg);
+
+void client_init(struct client *client, struct job_generic *init_job) {
   client->quiche_conn = NULL;
   client->quiche_config = quiche_config_new(QUICHE_PROTOCOL_VERSION);
   client->local_addr_len = sizeof client->local_addr;
 
   quiche_config_set_application_protos(client->quiche_config,
                                        (uint8_t *)RIDE_ALPN, RIDE_ALPN_LEN);
+  quiche_config_set_max_idle_timeout(client->quiche_config, 5000);
+  quiche_config_set_initial_max_data(client->quiche_config, 10000000);
+  quiche_config_set_initial_max_stream_data_bidi_local(client->quiche_config,
+                                                       1000000);
+  quiche_config_set_initial_max_stream_data_uni(client->quiche_config, 1000000);
+  quiche_config_set_initial_max_streams_bidi(client->quiche_config, 100);
+  quiche_config_set_initial_max_streams_uni(client->quiche_config, 100);
+  quiche_config_set_disable_active_migration(client->quiche_config, true);
+
+  init_job->callback = client_advance;
+  init_job->callback_arg = client;
 }
 
 static int client_connect(struct client *client) {
@@ -179,30 +184,33 @@ static int client_connect(struct client *client) {
     fprintf(stderr, "could not create quich conn\n");
     return 1;
   }
+
   return 0;
 }
 
-// TODO: (wip) make async, implement draining and timeouts
-//        and integrate into worker existing task system
-void client_advance(struct client *client) {
+// TODO: (wip) make connect and draining async
+uint64_t client_advance(void *arg) {
   int n, c;
+  uint64_t timeout;
   bool prev_connected;
+  struct client *client = (struct client *)arg;
 
+  printf("advancing... connected? %d\n", client->quiche_conn != NULL);
   if (!client->quiche_conn) {
     printf("Connecting...\n");
     if (client_connect(client)) {
       fprintf(stderr, "could not create quich conn\n");
-      return;
+      return 1;
     }
   }
 
   prev_connected = quiche_conn_is_established(client->quiche_conn);
-  //TODO: make async and fault tolerante
+  // TODO: make async and fault tolerante
   c = 10000;
   while (!quiche_conn_is_established(client->quiche_conn) && c--) {
     if ((n = flush_out(client)) < 0) {
       fprintf(stderr, "failed to connect: %d\n", n);
-      return;
+      return 1;
     }
 
     if ((n = client_receive(client)) == -EWOULDBLOCK) {
@@ -211,17 +219,54 @@ void client_advance(struct client *client) {
   }
 
   // by this point we should be connected
-  if (!quiche_conn_is_established(client->quiche_conn)) {
+  if (!quiche_conn_is_established(client->quiche_conn) ||
+      quiche_conn_is_closed(client->quiche_conn)) {
     printf("connection error\n");
     quiche_conn_free(client->quiche_conn);
     client->quiche_conn = NULL;
     init_addr();
-    return;
+    return 1;
   }
 
   if (!prev_connected) {
     printf("Connected!\n");
   }
-  // flush_out(client);
-  // client_receive(client);
+  
+  quiche_conn_on_timeout(client->quiche_conn);
+  flush_out(client);
+  client_receive(client);
+
+  // TODO: this blocks async loop, consider integrating into async loop
+  while ((n = client_receive(client)) != -EWOULDBLOCK) {
+    if (n == QUICHE_ERR_DONE)
+      break;
+    continue;
+  }
+  timeout = quiche_conn_timeout_as_millis(client->quiche_conn);
+  if (!timeout) {
+    timeout = 1000;
+  }
+  return timeout;
+}
+
+int client_verify_request(struct client *client) {
+  if (!client->quiche_conn ||
+      !quiche_conn_is_established(client->quiche_conn) ||
+      quiche_conn_is_closed(client->quiche_conn))
+    return -1;
+  uint64_t err;
+  ssize_t n;
+
+  err = 0;
+  const static uint8_t buf[] = "hello world\n";
+  printf("sending hello world\n");
+  if ((n = quiche_conn_stream_send(client->quiche_conn, 4, buf, sizeof buf,
+                                   true, &err)) < 0) {
+    if (n == QUICHE_ERR_DONE)
+      return 0;
+    fprintf(stderr, "error sending stream: %ld (%zd)\n", err, n);
+  }
+  printf("sent %zu bytes\n", n);
+  client_advance(client);
+  return 0;
 }

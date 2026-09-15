@@ -1,12 +1,15 @@
 #include "queue.h"
 #include "ride.h"
-#include <emmintrin.h>
+#include <asm-generic/errno.h>
+#include <errno.h>
 #include <pthread.h>
 #include <stdalign.h>
 #include <stdatomic.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/time.h>
 
 struct spinlock {
   atomic_bool flag;
@@ -61,16 +64,37 @@ int queue_consume_try(struct event *event) {
 
 // blocks when queue is empty
 // unless global flag `quit` is raised, at which point it returns 1
-int queue_consume(struct event *event) {
-  pthread_mutex_lock(&queue_lock);
+int queue_consume(struct event *event, uint64_t timeout_ms) {
+  struct timespec ts;
+  struct timeval now;
 
-  while (queue.head == queue.tail && !quit) {
-    pthread_cond_wait(&queue_cond, &queue_lock);
+  pthread_mutex_lock(&queue_lock);
+  gettimeofday(&now, NULL);
+  long seconds = timeout_ms / 1000;
+  long msecs = timeout_ms - seconds * 1000;
+  ts.tv_sec = now.tv_sec + seconds;
+  ts.tv_nsec = now.tv_usec * 1000 + msecs * 1000000;
+  if (ts.tv_nsec > 999999999) {
+    ts.tv_nsec -= 999999999;
+    ts.tv_sec += 1;
+  }
+
+  if (queue.head == queue.tail && !quit) {
+    if (pthread_cond_timedwait(&queue_cond, &queue_lock, &ts) == ETIMEDOUT) {
+      pthread_mutex_unlock(&queue_lock);
+      return ETIMEDOUT;
+    }
   }
 
   if (quit) {
     pthread_mutex_unlock(&queue_lock);
-    return 1;
+    return ESHUTDOWN;
+  }
+
+  // check for spurious wake ups
+  if (queue.head == queue.tail && !quit) {
+    pthread_mutex_unlock(&queue_lock);
+    return ETIMEDOUT;
   }
 
   memcpy(event, &queue.events[queue.tail], sizeof(struct event));
