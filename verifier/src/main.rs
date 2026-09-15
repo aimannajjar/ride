@@ -92,7 +92,12 @@ impl Worker {
             .expect("couldn't load TLS cert");
 
         config.set_disable_active_migration(false);
-
+        config.set_max_idle_timeout(5000);
+        config.set_initial_max_data(1000000);
+        config.set_initial_max_stream_data_bidi_local(1000000);
+        config.set_initial_max_stream_data_uni(1000000);
+        config.set_initial_max_streams_bidi(100);
+        config.set_initial_max_streams_uni(100);
         config.set_application_protos(RIDE_ALPN).unwrap();
 
         socket
@@ -190,7 +195,10 @@ impl Worker {
             // process receives if any
             loop {
                 match self.socket.recv_from(&mut self.buffer) {
-                    Ok(v) => self.on_recv(v.0, v.1),
+                    Ok(v) => {
+                        println!("received something");
+                        self.on_recv(v.0, v.1)
+                    }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                     Err(e) => {
                         println!("Error: {e}");
@@ -260,10 +268,27 @@ impl Worker {
             to: self.local_address,
         };
 
+        
+        println!("processing packet with header type: {:?}", hdr.ty);
         ride_client
             .conn
             .recv(pkt, recv_info)
             .expect("failed ingesting recv packet");
+
+        if ride_client.conn.is_in_early_data() || ride_client.conn.is_established() {
+            println!("checking streams");
+            let buf = unsafe { self.buffer.assume_init_mut() };
+            for s in ride_client.conn.readable() {
+                while let Ok((n, _fin)) = ride_client.conn.stream_recv(s, buf) {
+                    println!("received {} bytes", n);
+                    println!("msg: {}", unsafe {
+                        String::from_utf8_unchecked(buf.to_vec())
+                    });
+                }
+            }
+        } else {
+            println!("conn is not established");
+        }
 
         if let Some(instant) = ride_client.conn.timeout_instant() {
             self.timeouts.push(Reverse((instant, dcid)));
