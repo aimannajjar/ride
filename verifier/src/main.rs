@@ -1,3 +1,4 @@
+use log::{LevelFilter, debug, error, info, trace};
 use quiche::RecvInfo;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::cmp::Reverse;
@@ -14,9 +15,11 @@ use std::time::Instant;
 const ADDRESS: &str = "127.0.0.1:4433";
 const RIDE_ALPN: &[&[u8]] = &[b"ride0.1"];
 const MAXEVENTS: usize = 10;
+const MAX_DATAGRAM_SIZE: usize = 1350;
 
 struct RideClient {
     conn: quiche::Connection,
+    last_timeout: Option<Instant>,
 }
 
 // -------------------------------------
@@ -91,13 +94,17 @@ impl Worker {
             .load_cert_chain_from_pem_file(&tls_cert.to_string_lossy())
             .expect("couldn't load TLS cert");
 
-        config.set_disable_active_migration(false);
-        config.set_max_idle_timeout(5000);
-        config.set_initial_max_data(1000000);
-        config.set_initial_max_stream_data_bidi_local(1000000);
-        config.set_initial_max_stream_data_uni(1000000);
-        config.set_initial_max_streams_bidi(100);
-        config.set_initial_max_streams_uni(100);
+        config.set_disable_active_migration(true);
+        config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
+        config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
+        config.set_max_idle_timeout(10000000);
+        config.set_initial_max_data(10000000);
+        config.set_initial_max_stream_data_bidi_local(10000000);
+        config.set_initial_max_stream_data_bidi_remote(1000000);
+        config.set_initial_max_stream_data_uni(10000000);
+        config.set_initial_max_streams_bidi(1000);
+        config.set_initial_max_streams_uni(1000);
+        config.enable_early_data();
         config.set_application_protos(RIDE_ALPN).unwrap();
 
         socket
@@ -149,7 +156,7 @@ impl Worker {
 
     fn run(&mut self) {
         // main event loop
-        println!("Listening");
+        info!("Listening");
         loop {
             let mut events: [epoll_event; MAXEVENTS] = unsafe { mem::zeroed() };
 
@@ -162,6 +169,7 @@ impl Worker {
                 None => -1,
             };
 
+            debug!("polling with timeout {}", timeout);
             let n = unsafe {
                 let n = epoll_wait(self.epfd, events.as_mut_ptr(), 10, timeout);
                 if n == -1 {
@@ -170,70 +178,114 @@ impl Worker {
                 }
                 n
             };
+            debug!("polling returned {} events", n);
 
-            // handle deadlines
+            // handle timeouts
             loop {
+                trace!("checking timers. timers count: {}", self.timeouts.len());
                 let expired = matches!(self.timeouts.peek(), Some(Reverse((expiry, cid))) if *expiry < Instant::now());
                 if !expired {
+                    trace!("no timeouts have occurred");
                     break;
                 }
 
                 // call timeout handler and re-arm timer
-                let Reverse((_, cid)) = self.timeouts.pop().unwrap();
+                let Reverse((expiry, cid)) = self.timeouts.pop().unwrap();
                 if let Some(client) = self.clients.get_mut(&*cid) {
+                    trace!(
+                        "conn {:?} timed out. expiry={:?}, now={:?}, last_timeout={:?}",
+                        client.conn.trace_id(),
+                        expiry,
+                        Instant::now(),
+                        client.last_timeout,
+                    );
+
+                    if let Some(last_timeout) = client.last_timeout
+                        && last_timeout >= expiry
+                    {
+                        trace!(
+                            "conn {:?} already processed a later timeout={:?} skipping",
+                            client.conn.trace_id(),
+                            last_timeout
+                        );
+                        continue;
+                    }
+
+                    debug!("conn {:?} timeout", client.conn.trace_id(),);
                     client.conn.on_timeout();
+                    client.last_timeout = Some(expiry);
+
                     if let Some(expiry) = client.conn.timeout_instant() {
+                        trace!(
+                            "conn {:?} re-arm timer to expiry={:?}",
+                            client.conn.trace_id(),
+                            expiry,
+                        );
                         self.timeouts.push(Reverse((expiry, cid)));
+                    } else {
+                        trace!("conn {:?} disarm timer", client.conn.trace_id());
                     }
                 }
             }
 
-            if n == 0 {
-                continue;
-            }
-
             // process receives if any
-            loop {
-                match self.socket.recv_from(&mut self.buffer) {
-                    Ok(v) => {
-                        println!("received something");
-                        self.on_recv(v.0, v.1)
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(e) => {
-                        println!("Error: {e}");
-                        continue;
-                    }
-                };
+            if n > 0 {
+                trace!("processing receives");
+                'read: loop {
+                    match self.socket.recv_from(&mut self.buffer) {
+                        Ok(v) => {
+                            debug!("received {} bytes", v.0);
+                            if !self.on_recv(v.0, v.1) {
+                                continue 'read;
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(e) => {
+                            error!("Error: {e}");
+                            continue;
+                        }
+                    };
+                }
+            } else {
+                debug!("no receive events");
             }
 
             // process sends
-            println!("sending");
             for client in self.clients.values_mut() {
-                let conn = &mut client.conn;
-                let mut send_buf = unsafe { self.buffer.assume_init_mut() };
-                let (len, send_info) = match conn.send(&mut send_buf) {
-                    Ok(v) => v,
-                    Err(quiche::Error::Done) => break,
-                    Err(e) => {
-                        println!("Error {}", e);
-                        continue;
-                    }
-                };
-                println!("sending {} bytes", len);
+                trace!("conn {:?} processing sends", client.conn.trace_id());
+                loop {
+                    let conn = &mut client.conn;
+                    let mut send_buf = unsafe { self.buffer.assume_init_mut() };
+                    let (len, send_info) = match conn.send(&mut send_buf) {
+                        Ok(v) => v,
+                        Err(quiche::Error::Done) => break,
+                        Err(e) => {
+                            error!("Error {}", e);
+                            continue;
+                        }
+                    };
 
-                self.socket
-                    .send_to(&send_buf[..len], &send_info.to.into())
-                    .expect("failed :(");
+                    self.socket
+                        .send_to(&send_buf[..len], &send_info.to.into())
+                        .expect("failed :(");
+
+                    trace!("conn {:?} sent {} bytes", conn.trace_id(), len);
+                }
+
+                debug!(
+                    "conn {:?} stats {:?}",
+                    client.conn.trace_id(),
+                    client.conn.stats()
+                );
             }
 
             // drop closed connections
             self.clients.retain(|_, client| {
                 if client.conn.is_closed() {
-                    println!(
-                        "dropping {} : {:?}",
+                    info!(
+                        "conn {:?} dropped {:?}",
                         client.conn.trace_id(),
-                        client.conn.stats()
+                        client.conn.stats(),
                     );
                 }
                 !client.conn.is_closed()
@@ -243,13 +295,35 @@ impl Worker {
 
     // process a single receive
     // if connection ID is new, add it to clients map
-    fn on_recv(&mut self, len: usize, from: SockAddr) -> (usize, SockAddr) {
+    fn on_recv(&mut self, len: usize, from: SockAddr) -> bool {
         // read header to determine if new conn
         let pkt = unsafe { self.buffer[..len].assume_init_mut() };
-        let hdr = quiche::Header::from_slice(pkt, quiche::MAX_CONN_ID_LEN).expect("invalid header");
+
+        //TODO: generate proper conn ids
+        let hdr = quiche::Header::from_slice(pkt, 16).expect("invalid header");
 
         let dcid: Rc<[u8]> = Rc::from(hdr.dcid.as_ref());
-        let ride_client = self.clients.entry(dcid.clone()).or_insert_with(|| {
+        trace!("received hdr: {:?}", hdr);
+
+        let ride_client = if !self.clients.contains_key(&dcid) {
+            if !quiche::version_is_supported(hdr.version) {
+                error!(
+                    "WARNING: need to do version negotiaion, got version: {}",
+                    hdr.version
+                );
+
+                let len = quiche::negotiate_version(&hdr.scid, &hdr.dcid, unsafe {
+                    self.buffer.assume_init_mut()
+                })
+                .unwrap();
+
+                self.socket
+                    .send_to(unsafe { self.buffer[..len].assume_init_mut() }, &from)
+                    .expect("failed sending neogitation packet");
+                debug!("Sent negotiate packet");
+                return false;
+            }
+
             let conn = quiche::accept(
                 &hdr.dcid,
                 None,
@@ -259,47 +333,72 @@ impl Worker {
             )
             .expect("error accepting conn");
 
-            println!("New connetion!");
-            RideClient { conn }
-        });
+            info!("conn {:?} accepted", conn.trace_id());
+            self.clients.insert(
+                dcid.clone(),
+                RideClient {
+                    conn,
+                    last_timeout: None,
+                },
+            );
+            self.clients.get_mut(&dcid).unwrap()
+        } else {
+            let conn = self.clients.get_mut(&dcid).unwrap();
+            trace!("conn {:?} known", conn.conn.trace_id());
+            conn
+        };
 
         let recv_info = RecvInfo {
             from: from.as_socket().unwrap(),
             to: self.local_address,
         };
 
-        
-        println!("processing packet with header type: {:?}", hdr.ty);
+        trace!(
+            "conn {:?} processing packet with header type: {:?}",
+            ride_client.conn.trace_id(),
+            hdr.ty
+        );
+
         ride_client
             .conn
             .recv(pkt, recv_info)
             .expect("failed ingesting recv packet");
 
         if ride_client.conn.is_in_early_data() || ride_client.conn.is_established() {
-            println!("checking streams");
+            trace!("conn {:?} checking streams", ride_client.conn.trace_id());
             let buf = unsafe { self.buffer.assume_init_mut() };
             for s in ride_client.conn.readable() {
                 while let Ok((n, _fin)) = ride_client.conn.stream_recv(s, buf) {
-                    println!("received {} bytes", n);
-                    println!("msg: {}", unsafe {
-                        String::from_utf8_unchecked(buf.to_vec())
+                    debug!("received {} bytes", n);
+                    info!("msg: {}", unsafe {
+                        String::from_utf8_unchecked(buf[..n].to_vec())
                     });
                 }
             }
         } else {
-            println!("conn is not established");
+            trace!("conn {:?} is not established", ride_client.conn.trace_id());
         }
 
         if let Some(instant) = ride_client.conn.timeout_instant() {
+            debug!(
+                "conn {:?} arm timer, expiry={:?}",
+                ride_client.conn.trace_id(),
+                instant
+            );
             self.timeouts.push(Reverse((instant, dcid)));
         }
-        (len, from)
+        true
     }
 }
 
 fn main() {
+    unsafe { std::env::set_var("RUST_LOG", "debug,quiche=info"); };
+    env_logger::builder()
+        .filter_module("verifier", LevelFilter::Trace)
+        .init();
+
     thread::scope(|s| {
-        for _ in 0..3 {
+        for _ in 0..1 {
             s.spawn(|| {
                 let mut w = Worker::new();
                 w.run();

@@ -5,6 +5,12 @@ cleanup() {
   sudo kill "$PID" 2>/dev/null || true
 }
 
+
+if pgrep "ride"; then
+  echo "There's already 'ride' process running, please shutdown any ride instances before running tests";
+  exit 1;
+fi;
+
 ## Quick functional test for smoke testing
 declare -A EXPECTED
 EXPECTED["test1.txt"]="c7a0610dcb62188f14592f425924265085ecaf51c85c25967a240994c6c129cd";

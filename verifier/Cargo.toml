@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-quiche = "0.29.3"
+env_logger = "0.11.11"
+log = "0.4.34"
+quiche = "0.30.0"
+ring = "0.17.14"
 rnd = "0.1.1"
 socket2 = { version = "0.6.5", features = ["all"] } 

@@ -2,7 +2,7 @@
 
 NAME 				:= ride
 BUILD_DIR		:= build
-SRCS				:= $(wildcard src/*.c)
+SRCS				:= $(wildcard src/*.c) src/log.h
 BPF_SRCS 		:= $(wildcard src/*.bpf.c)
 BPF_OBJS		:= $(BPF_SRCS:src/%.c=$(BUILD_DIR)/%.o)
 BPF_INCLUDE := -I${LINUX} -I${LIBBPF} -I./src

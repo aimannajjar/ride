@@ -24,6 +24,11 @@
 set -euo pipefail
 ulimit -n 65535
 
+if pgrep "ride"; then
+  echo "There's already 'ride' process running, please shutdown any ride instances before running tests";
+  exit 1;
+fi;
+
 cleanup() {
   sudo kill "$PID" 2>/dev/null || true
   kill "$WORKLOAD_PID" 2>/dev/null || true
@@ -38,7 +43,7 @@ EMPTY_FILES=${5:-0}
 PERF=${6:-0} # 0 = none, 1 = record, 2 = stat
 
 THREADS=4
-CONCURRENCY=32
+CONCURRENCY=64
 CORES="4,5,6,7,8" # NOTE: cores 0,1,2,3 reserved for load generator
                   # # of cores should be equal to THREADS + 1 (for main thread)
 USE_PRE_EXISITNG_DUMMIES=1
@@ -145,7 +150,7 @@ if (( ! SKIP_CORRECTNESS )); then
   
   done } < "${TMP}/output.txt"
 else
-  echo "! Skipping correctness per test parameters, assume all reads correct"
+  echo "! Skipping correctness per test parameters, assume ride hashed all files correctly"
   pass_count=$(tail -n +2 "$TMP"/output.txt | wc -l)
   pass_count=$((pass_count-1))  # last process was probably interrupted
 fi;

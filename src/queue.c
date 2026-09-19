@@ -16,7 +16,6 @@ struct spinlock {
 
 extern atomic_int quit; // ride.c
 pthread_mutex_t queue_lock = PTHREAD_MUTEX_INITIALIZER;
-pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
 
 struct queue {
   struct event events[QUEUE_SIZE];
@@ -39,7 +38,6 @@ int queue_add(struct event *event) {
 
   memcpy(&queue.events[queue.head], event, sizeof(struct event));
   queue.head = (queue.head + 1) % QUEUE_SIZE;
-  pthread_cond_signal(&queue_cond);
   pthread_mutex_unlock(&queue_lock);
   return 0;
 }
@@ -64,36 +62,10 @@ int queue_consume_try(struct event *event) {
 // blocks when queue is empty
 // unless global flag `quit` is raised, at which point it returns 1
 int queue_consume(struct event *event, uint64_t timeout_ms) {
-  struct timespec ts;
-  struct timeval now;
-
   pthread_mutex_lock(&queue_lock);
-  gettimeofday(&now, NULL);
-  long seconds = timeout_ms / 1000;
-  long msecs = timeout_ms - seconds * 1000;
-  ts.tv_sec = now.tv_sec + seconds;
-  ts.tv_nsec = now.tv_usec * 1000 + msecs * 1000000;
-  if (ts.tv_nsec > 999999999) {
-    ts.tv_nsec -= 999999999;
-    ts.tv_sec += 1;
-  }
-
-  if (queue.head == queue.tail && !quit) {
-    if (pthread_cond_timedwait(&queue_cond, &queue_lock, &ts) == ETIMEDOUT) {
-      pthread_mutex_unlock(&queue_lock);
-      return ETIMEDOUT;
-    }
-  }
-
-  if (quit) {
+  if (queue.head == queue.tail) {
     pthread_mutex_unlock(&queue_lock);
-    return ESHUTDOWN;
-  }
-
-  // check for spurious wake ups
-  if (queue.head == queue.tail && !quit) {
-    pthread_mutex_unlock(&queue_lock);
-    return ETIMEDOUT;
+    return 0;
   }
 
   memcpy(event, &queue.events[queue.tail], sizeof(struct event));

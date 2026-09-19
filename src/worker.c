@@ -1,9 +1,10 @@
-#include <asm-generic/errno.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <sys/epoll.h>
 #define _GNU_SOURCE
-
 #include "client.h"
 #include "hasher.h"
+#include "log.h"
 #include "queue.h"
 #include "ride.h"
 #include "worker.h"
@@ -21,7 +22,7 @@
 #define READ_BUF_SIZE 65536
 #define OUTPUT_MAX_SIZE 512
 #define JOB_QUEUE_DEPTH 128 // TODO: make run-time configurable
-#define DEFAULT_TIMEOUT 300
+#define DEFAULT_TIMEOUT INT_MAX
 
 static_assert(!(READ_BUF_SIZE & (4096 - 1)), "BUFFER SIZE must be 4K aligned");
 
@@ -36,6 +37,12 @@ enum job_type {
   GENERIC,
 };
 
+[[maybe_unused]]
+static inline char *job_type_name(enum job_type t) {
+  static char *types[] = {"HASH", "PRINT", "VERIFY", "GENERIC"};
+  return types[t];
+}
+
 enum task_state {
   IDLE,
   RUNNING,
@@ -44,7 +51,7 @@ enum task_state {
 // encodes parameters specific to hash jobs
 struct job_hash {
   unsigned char hash[HASH_LEN];
-  unsigned char path[MAX_FILENAME_LEN];
+  char path[MAX_FILENAME_LEN];
   struct hasher hasher;
   off_t offset;
   int fd;
@@ -55,12 +62,6 @@ struct job_print {
   unsigned char msg[OUTPUT_MAX_SIZE];
   size_t len;
   off_t offset;
-};
-
-// verify jobs
-struct job_verify {
-  unsigned char hash[HASH_LEN];
-  unsigned char path[MAX_FILENAME_LEN];
 };
 
 // This struct contain the actual specification
@@ -98,8 +99,10 @@ struct task {
 };
 
 struct worker {
-  // io_uring
+  // io_uring / event loop data
   struct io_uring ring;
+  int epollfd;
+  int queue_efd; // eventfd for main thread producer notifies (passed as warg)
 
   // verifier
   struct client verifier;
@@ -126,27 +129,119 @@ struct worker {
   bool verify;
 };
 
+#ifdef LOG_TRACE
+#define LIST_INTEGRITY_CHECK(worker, skip, print)                              \
+  (list_integrity_check(worker, skip, print))
+#else
+#define LIST_INTEGRITY_CHECK(worker, skip, print)
+#endif
+
 [[maybe_unused]]
-void static inline trace_print_tasks(const struct worker *worker) {
+void static inline list_integrity_check(const struct worker *worker,
+                                        ssize_t skip_slot_id, bool verbose) {
+#define COND_LOG(...)                                                          \
+  {                                                                            \
+    if (verbose)                                                               \
+      log_trace(__VA_ARGS__);                                                  \
+  }
+
+#define ASSERT(P, ...)                                                         \
+  {                                                                            \
+    if (!(P))                                                                  \
+      log_error(__VA_ARGS__);                                                  \
+    assert(P);                                                                 \
+  }
+
   struct task *task;
+  struct job_slot *slot;
+  size_t seen_ids[JOB_QUEUE_DEPTH] = {0};
   ssize_t i;
 
+  log_trace("checking lists integrity");
+  COND_LOG("------------ tasks ------------- ");
   for (i = 0; i < worker->nr_tasks; i++) {
     task = &worker->tasks[i];
-    if (task->state == RUNNING)
-      printf("task %ld, slot id: %zd, type: %d\n", task->id, task->job_slot->id,
-             task->job_slot->job.type);
+    if (task->state == RUNNING) {
+      COND_LOG("task %ld, slot id: %zd, type: %s", task->id, task->job_slot->id,
+               job_type_name(task->job_slot->job.type));
+
+      switch (task->job_slot->job.type) {
+      case HASH:
+        COND_LOG("  path: %s", task->job_slot->job.as.hash_job.path);
+        break;
+      case PRINT:
+        COND_LOG("  buffer: %.*s", task->job_slot->job.as.print_job.len - 1,
+                 task->job_slot->job.as.print_job.msg);
+        break;
+      default:
+        break;
+      }
+      seen_ids[task->job_slot->id] = 1;
+    }
   }
-}
 
-[[maybe_unused]]
-void static inline trace_print_queued(const struct worker *worker) {
-  struct job_slot *slot;
-
+  COND_LOG("------------ queue ------------- ");
   slot = worker->queued_head;
   while (slot) {
+    ASSERT(!seen_ids[slot->id], "slot_id %zd seen in task and queue list",
+           slot->id);
+    COND_LOG("slot id %zd (type=%s)", slot->id, job_type_name(slot->job.type));
+
+    switch (slot->job.type) {
+    case HASH:
+      COND_LOG("  path: %s", slot->job.as.hash_job.path);
+      break;
+    case PRINT:
+      COND_LOG("  buffer: %.*s", slot->job.as.print_job.len - 1,
+               slot->job.as.print_job.msg);
+      break;
+    default:
+      break;
+    }
+
+    seen_ids[slot->id] = 1;
     slot = slot->next;
   }
+
+  COND_LOG("----------- free list ----------");
+  slot = worker->free_slots;
+  while (slot) {
+    if (verbose)
+      printf("| %zd | -> ", slot->id);
+
+    // it's possible for slot to briefly appear in task and free list, this
+    // happens when the job is returned to free_list but task still hasn't
+    // been freed yet, see task_free and return_job
+    if (skip_slot_id == slot->id) {
+      seen_ids[slot->id] = 1;
+      slot = slot->next;
+      continue;
+    }
+
+    ASSERT(!seen_ids[slot->id],
+           "slot_id %zd seen in free list and some other list", slot->id);
+    seen_ids[slot->id] = 1;
+    slot = slot->next;
+  }
+
+  if (verbose)
+    printf("\n");
+  COND_LOG("--------------------------------");
+
+  for (i = 0; i < JOB_QUEUE_DEPTH; i++) {
+    // it's possible for a job slot to float, i.e not exist in any list
+    // this happens brielfy when a slot has been dequeued and lists checked
+    // before the slot has been scheduled in the tasks list (see task_take)
+    if (skip_slot_id == i)
+      continue;
+
+    if (!seen_ids[i]) {
+      log_error("slot_id %zd not seen in any list", i);
+      exit(1);
+    }
+  }
+  log_trace("lists integrity validated");
+#undef COND_LOG
 }
 
 // Adds a job to queue list
@@ -155,6 +250,8 @@ void static inline trace_print_queued(const struct worker *worker) {
 // from enqueue_job
 static struct job_slot *enqueue_job(struct worker *worker,
                                     struct job_slot *job_slot) {
+  LIST_INTEGRITY_CHECK(worker, -1, false);
+
   // take first available slot and move head
   if (!job_slot) {
     job_slot = worker->free_slots;
@@ -173,14 +270,20 @@ static struct job_slot *enqueue_job(struct worker *worker,
     worker->queued_tail = job_slot;
   }
 
+  log_trace("enqueued job_slot slot_id=%zd (%p) job_id=%zd (%p)", job_slot->id,
+            job_slot, job_slot->job.id, &job_slot->job);
+
+  LIST_INTEGRITY_CHECK(worker, -1, false);
   return job_slot;
 }
 
-// Pops first element from queue list
+// Pops first element from queue list (e.g. when taking a task)
 // Note, the caller must return it to free list by calling return job
 // or alternatively call requeue to add it back to queue list
 static struct job_slot *dequeue_job(struct worker *worker) {
   struct job_slot *job_slot;
+
+  LIST_INTEGRITY_CHECK(worker, -1, false);
 
   // take first free queued job, and move head to next one
   if (!worker->queued_head)
@@ -192,24 +295,39 @@ static struct job_slot *dequeue_job(struct worker *worker) {
   if (worker->queued_head)
     worker->queued_head->prev = NULL;
 
+  log_trace("dequeued job slot_id=%zd (%p) id=%zd (%p)", job_slot->id, job_slot,
+            job_slot->job.id, &job_slot->job);
+
+  LIST_INTEGRITY_CHECK(worker, job_slot->job.id, false);
   return job_slot;
 }
 
 // returns a job slot to free list
 static void return_job(struct worker *worker, struct job_slot *job_slot) {
+  LIST_INTEGRITY_CHECK(worker, -1, true);
+
+  log_trace("returning job slot_id=%zd (%p) id=%zd (%p)", job_slot->id,
+            job_slot, job_slot->job.id, &job_slot->job);
   job_slot->next = worker->free_slots;
   job_slot->prev = NULL; // free list is singly linked list
   worker->free_slots = job_slot;
+
+  LIST_INTEGRITY_CHECK(worker, job_slot->job.id, false);
 }
 
-// This has the same effect as calling enqueu_job and passing job_slot
+// This has the same effect as calling enqueue_job and passing job_slot
 static void requeue_job(struct worker *worker, struct job_slot *job_slot) {
+  LIST_INTEGRITY_CHECK(worker, -1, false);
+  log_trace("requeuing job slot_id=%zd (%p) id=%zd (%p)", job_slot->id,
+            job_slot, job_slot->job.id, &job_slot->job);
   enqueue_job(worker, job_slot);
+  LIST_INTEGRITY_CHECK(worker, -1, false);
 }
 
 static void worker_setup(struct worker *worker,
                          const struct worker_args *wargs) {
   ssize_t i;
+  struct epoll_event ev;
   worker->id = wargs->id;
   worker->pending_submits = 0;
   worker->nr_tasks = wargs->io_concurrency;
@@ -231,13 +349,30 @@ static void worker_setup(struct worker *worker,
   worker->slots = malloc(JOB_QUEUE_DEPTH * sizeof(struct job_slot));
   worker->slots[JOB_QUEUE_DEPTH - 1].next = NULL;
   worker->slots[JOB_QUEUE_DEPTH - 1].id = JOB_QUEUE_DEPTH - 1;
+  worker->slots[JOB_QUEUE_DEPTH - 1].job.id = JOB_QUEUE_DEPTH - 1;
   for (i = JOB_QUEUE_DEPTH - 2; i >= 0; i--) {
     worker->slots[i].next = &worker->slots[i + 1];
     worker->slots[i].id = i;
+    worker->slots[i].job.id = i;
   }
   worker->free_slots = worker->slots;
   worker->queued_head = NULL;
   worker->queued_tail = NULL;
+
+  // setup epoll
+  worker->epollfd = epoll_create1(0);
+  worker->queue_efd = wargs->queue_eventfd;
+  if (worker->epollfd == -1) {
+    perror("epoll_create1");
+    exit(EXIT_FAILURE);
+  }
+
+  ev.events = EPOLLIN | EPOLLET | EPOLLEXCLUSIVE;
+  ev.data.fd = wargs->queue_eventfd;
+  if (epoll_ctl(worker->epollfd, EPOLL_CTL_ADD, wargs->queue_eventfd, &ev)) {
+    perror("epoll_ctl");
+    exit(EXIT_FAILURE);
+  };
 
   // setup io_uring
   io_uring_queue_init(worker->nr_tasks, &worker->ring, 0);
@@ -278,6 +413,9 @@ static struct task *task_take(struct worker *worker) {
   size_t tid;
   struct job_slot *job_slot;
   struct task *task;
+
+  LIST_INTEGRITY_CHECK(worker, -1, false);
+
   if (worker->tsp == worker->nr_tasks) {
     fprintf(stderr, "warning: not enough executors\n");
     return NULL;
@@ -290,6 +428,11 @@ static struct task *task_take(struct worker *worker) {
   task = &worker->tasks[tid];
   task->job_slot = job_slot;
   task->state = RUNNING;
+
+  log_trace("took task tid = %zd", tid);
+
+  LIST_INTEGRITY_CHECK(worker, -1, true);
+
   return task;
 }
 
@@ -298,7 +441,7 @@ static void task_hash_prep_submit(struct worker *worker, struct task *task) {
   struct job *job = &task->job_slot->job;
   struct job_hash *hjob = &job->as.hash_job;
   sqe = io_uring_get_sqe(&worker->ring);
-  io_uring_prep_read(sqe, hjob->fd, worker->buffers[job->id],
+  io_uring_prep_read(sqe, hjob->fd, worker->buffers[task->id],
                      sizeof(*worker->buffers), hjob->offset);
   io_uring_sqe_set_data(sqe, (void *)task);
   worker->pending_submits++;
@@ -321,21 +464,21 @@ static void task_io_submissions_flush(struct worker *worker) {
   worker->pending_submits = 0;
 }
 
-void enqueue_job_verify(struct worker *worker, const struct event *event,
-                        int fd) {
+void enqueue_job_verify(struct worker *worker, const struct job_hash *hjob) {
   struct job_slot *job_slot;
   struct job *job;
 
+  log_trace("enqueuing hash verify job");
   job_slot = enqueue_job(worker, NULL);
   job = &job_slot->job;
 
   // populate job
-  job->as.hash_job.fd = fd;
-  job->as.hash_job.offset = 0;
-  job->type = HASH;
-  memset(job->as.hash_job.hash, 0, sizeof(job->as.hash_job.hash));
-  memcpy(job->as.hash_job.path, event->path, sizeof(job->as.hash_job.path));
-  hasher_init(&job->as.hash_job.hasher);
+  memcpy(job->as.verify_job.param.hash, hjob->hash,
+         sizeof(job->as.hash_job.hash));
+
+  memcpy(job->as.verify_job.param.path, hjob->path,
+         sizeof(job->as.verify_job.param.path));
+  job->type = VERIFY;
 }
 
 static void enqueue_job_hash(struct worker *worker, const struct event *event,
@@ -343,6 +486,8 @@ static void enqueue_job_hash(struct worker *worker, const struct event *event,
   struct job_slot *job_slot;
   struct job *job;
 
+  log_trace("enqueuing hash job for path=%s len=%ld", event->path,
+            event->path_len);
   job_slot = enqueue_job(worker, NULL);
   job = &job_slot->job;
 
@@ -356,11 +501,13 @@ static void enqueue_job_hash(struct worker *worker, const struct event *event,
 }
 
 // Performs initialization of new printing io task
-static void enqueue_job_print(struct worker *worker, size_t len,
+static void enqueue_job_print(struct worker *worker,
+                              const char path[MAX_FILENAME_LEN], size_t len,
                               const char msg[len]) {
   struct job_slot *job_slot;
   struct job *job;
 
+  log_trace("enqueuing hash print results job");
   job_slot = enqueue_job(worker, NULL);
   job = &job_slot->job;
 
@@ -368,7 +515,8 @@ static void enqueue_job_print(struct worker *worker, size_t len,
   job->type = PRINT;
   assert(len < sizeof(job->as.print_job.msg) &&
          "Bug: async output message too large");
-  strncpy((char *)job->as.print_job.msg, msg, sizeof(job->as.print_job.msg));
+
+  memcpy(job->as.print_job.msg, msg, sizeof(job->as.print_job.msg));
   job->as.print_job.msg[sizeof(job->as.print_job.msg) - 1] = '\0';
   job->as.print_job.len = len;
   job->as.print_job.offset = 0;
@@ -381,7 +529,9 @@ static void job_generic_free(struct job *job) {
   job->as.generic_job.callback = NULL;
 };
 
-static void job_hash_free(struct job *job) { close(job->as.hash_job.fd); }
+static void job_hash_free(struct job *job) {
+  // close(job->as.hash_job.fd);
+}
 
 static void task_reschedule(struct worker *worker, struct task *task) {
   struct job_slot *job_slot;
@@ -397,6 +547,7 @@ static void task_reschedule(struct worker *worker, struct task *task) {
 }
 
 static void task_free(struct worker *worker, struct task *task) {
+  LIST_INTEGRITY_CHECK(worker, -1, false);
   struct job_slot *job_slot;
   struct job *job;
 
@@ -423,10 +574,12 @@ static void task_free(struct worker *worker, struct task *task) {
   task->job_slot = NULL;
   task->state = IDLE;
   worker->free_tids[--worker->tsp] = task->id;
+  LIST_INTEGRITY_CHECK(worker, -1, false);
 }
 
 void static inline print_hash_result(struct worker *worker,
                                      const struct job_hash *htask) {
+  log_trace("printing hash results for %s", htask->path);
   char debug[OUTPUT_MAX_SIZE];
   size_t mlen;
 
@@ -441,15 +594,13 @@ void static inline print_hash_result(struct worker *worker,
 
   mlen += snprintf(debug + mlen, 5, "\" }\n");
 
-  enqueue_job_print(worker, mlen, debug);
+  enqueue_job_print(worker, htask->path, mlen, debug);
 }
 
 // Returns true if there are not tasks in execution and also no jobs in our
 // job queue. This excludes verifier background job which is always running
 // This can be used by callers to block until jobs are available to enqueue
 static bool need_work(const struct worker *worker) {
-  // because it always runs, we are interested in learning whether there is
-  // new work that is "completable"
   bool bg = (worker->verify && worker->verifier_config.requires_background_job);
 
   bool jobs_queued = worker->queued_head &&
@@ -474,36 +625,48 @@ static bool all_tasks_in_io_uring(const struct worker *worker) {
 void *worker_run(void *args) {
   struct worker worker;
   struct worker_args *wargs;
+  struct epoll_event epevents[1];
+  struct epoll_event verifier_ev;
   uint64_t timeout;
+  uint64_t verifier_fd;
 
   wargs = (struct worker_args *)args;
   worker_setup(&worker, wargs);
   free(wargs);
   wargs = NULL;
 
-  timeout = DEFAULT_TIMEOUT;
+  // event loop
+  timeout = 1;
+  verifier_fd = 0;
   while (!atomic_load_explicit(&quit, memory_order_acquire)) {
-    int fd;
-    int ret;
+    int ret, fd;
+    uint64_t ev_sem;
     struct event event;
     bool new_file_event = false;
 
     if (need_work(&worker)) {
+      log_trace("polling");
+      ret = epoll_wait(worker.epollfd, epevents, 1, timeout);
       // we have no tasks, poll
-      if ((ret = queue_consume(&event, 1000)) == ESHUTDOWN) {
-        goto done;
-      } else if (ret != ETIMEDOUT) {
-        new_file_event = true;
-      }
-    } else if (worker.tsp > 0 && worker.tsp < worker.nr_tasks) {
-      new_file_event = (!queue_consume_try(&event));
+      if (ret && epevents[0].data.fd == worker.queue_efd) {
+        if (quit)
+          goto done;
+        new_file_event = !queue_consume_try(&event);
+        if (read(epevents[0].data.fd, &ev_sem, sizeof ev_sem) !=
+            sizeof(ev_sem)) {
+          perror("read");
+          exit(1);
+        }
+      } // for other (non-queue) events or timeouts, read will be performed by
+        // respective task (e.g. verifier would consume socket event)
+    } else {
+      new_file_event = !queue_consume_try(&event);
     }
 
     if (new_file_event) {
       // we've consumed new task, schedule it in async loop
       if ((fd = open(event.path, O_RDONLY)) < 0) {
-        // TODO: logging macros
-        fprintf(stderr, "Error opening: %s: %s\n", event.path, strerror(errno));
+        log_error("Error opening: %s: %s", event.path, strerror(errno));
         continue;
       }
 
@@ -512,7 +675,8 @@ void *worker_run(void *args) {
 
     // Take a task
     struct task *task;
-    const struct job *job;
+    struct job *job;
+    int new_sock_fd;
     if ((task = task_take(&worker))) {
       job = &task->job_slot->job;
       switch (job->type) {
@@ -523,21 +687,34 @@ void *worker_run(void *args) {
       case PRINT:
         task_print_prep_submit(&worker, task);
         break;
+      case VERIFY:
+        log_debug("schedule verify request: %s", job->as.verify_job.param.path);
+        if (client_verify_request(&worker.verifier, &job->as.verify_job)) {
+          log_error("rescheduling task");
+          task_reschedule(&worker, task);
+        }
+        break;
       case GENERIC:
         assert(job->as.generic_job.callback &&
                "GENERIC job callback undefined");
         // ideally we want minimum timeout of all jobs but currently we only
         // have one job that publishes a timeout (verifier bg job)
         if (!(timeout = job->as.generic_job.callback(
-                  job->as.generic_job.callback_arg))) {
+                  job->as.generic_job.callback_arg, &new_sock_fd))) {
           // when generic job returns zero, it means it completed
           timeout = DEFAULT_TIMEOUT;
           task_free(&worker, task);
-          printf("freed generic job\n");
         } else {
           // non zero return, means task want to be rescheduled with returned
           // timeout
           task_reschedule(&worker, task);
+        }
+        if (new_sock_fd != verifier_fd) {
+          verifier_ev.events = EPOLLIN;
+          verifier_ev.data.fd = new_sock_fd;
+          log_debug("add verifier fd: %d to epoll set", new_sock_fd);
+          epoll_ctl(worker.epollfd, EPOLL_CTL_ADD, new_sock_fd, &verifier_ev);
+          verifier_fd = new_sock_fd;
         }
         break;
       default:
@@ -546,51 +723,50 @@ void *worker_run(void *args) {
       }
     }
 
-    // process io_uring completions if any
     struct io_uring_cqe *cqes[worker.nr_tasks];
     size_t i, n;
     n = io_uring_peek_batch_cqe(&worker.ring, cqes, worker.nr_tasks);
+
+    // TODO: integrate epoll into io_uring and poll via io_uring, or use
+    // io_uring's eventfd capability to notify epoll_wait
     while (!n && all_tasks_in_io_uring(&worker)) {
-      // when all task executors are waiting on CQEs and none is available
-      // block until we are able to make progress
-      _mm_pause(); // TODO: portability
+      _mm_pause();
       n = io_uring_peek_batch_cqe(&worker.ring, cqes, worker.nr_tasks);
     }
 
     // process completions
     for (i = 0; i < n; i++) {
-      struct task *itask = (struct task *)io_uring_cqe_get_data(cqes[i]);
-      struct job *ijob = &itask->job_slot->job;
+      task = (struct task *)io_uring_cqe_get_data(cqes[i]);
+      job = &task->job_slot->job;
       if (cqes[i]->res < 0) {
-        // TODO: logging macros
-        switch (ijob->type) {
+        log_error("io_uring error task type %d", job->id);
+        switch (job->type) {
         case HASH:
-          fprintf(stderr, "(slot %zu) Error async read: %s: %s\n", itask->id,
-                  ijob->as.hash_job.path, strerror(-cqes[i]->res));
+          log_error("(slot %zu) Error async read: %s: %s\n", task->id,
+                    job->as.hash_job.path, strerror(-cqes[i]->res));
           break;
         case PRINT:
-          // todo: PRINTING errors
           break;
         default:
           // handle any future tasks that are submitted through io uring here
           assert(false && "unreachable");
           break;
         }
-        task_free(&worker, itask);
+        task_free(&worker, task);
         continue;
       } else if (cqes[i]->res > 0) {
-        switch (ijob->type) {
+        switch (job->type) {
         case HASH:
-          hasher_update(&ijob->as.hash_job.hasher, cqes[i]->res,
-                        worker.buffers[itask->id]);
+          hasher_update(&job->as.hash_job.hasher, cqes[i]->res,
+                        worker.buffers[task->id]);
 
           // read next chunk
-          ijob->as.hash_job.offset += cqes[i]->res;
-          task_hash_prep_submit(&worker, itask);
+          job->as.hash_job.offset += cqes[i]->res;
+          task_hash_prep_submit(&worker, task);
           break;
         case PRINT:
-          ijob->as.print_job.offset += cqes[i]->res;
-          task_print_prep_submit(&worker, itask);
+          job->as.print_job.offset += cqes[i]->res;
+          task_print_prep_submit(&worker, task);
           break;
         default:
           assert(false && "unreachable");
@@ -598,17 +774,20 @@ void *worker_run(void *args) {
         }
       } else {
         // final completion
-        switch (ijob->type) {
+        switch (job->type) {
         case HASH:
-          hasher_finalize(&ijob->as.hash_job.hasher, ijob->as.hash_job.hash,
-                          sizeof(ijob->as.hash_job.hash));
+          hasher_finalize(&job->as.hash_job.hasher, job->as.hash_job.hash,
+                          sizeof(job->as.hash_job.hash));
 
-          task_free(&worker, itask);
+          print_hash_result(&worker, &job->as.hash_job);
+          if (worker.verify)
+            enqueue_job_verify(&worker, &job->as.hash_job);
 
-          print_hash_result(&worker, &ijob->as.hash_job);
+          // TODO: consider keeping around for zero-copy for the above
+          task_free(&worker, task);
           break;
         case PRINT:
-          task_free(&worker, itask);
+          task_free(&worker, task);
           break;
         default:
           assert(false && "unreachable");

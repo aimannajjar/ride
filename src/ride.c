@@ -9,9 +9,11 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdatomic.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/eventfd.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -26,8 +28,7 @@ struct ride_cli_args {
 };
 
 atomic_int quit = 0;
-extern pthread_mutex_t queue_lock; // queue.c
-extern pthread_cond_t queue_cond;  // queue.c
+static int queue_eventfd;
 
 /** most args are not actually used
  ** except for filename
@@ -95,7 +96,14 @@ static void ride_sig_handler([[maybe_unused]] int signal) {
 }
 
 static int ride_ringbuf_handle(void *ctx, void *data, size_t sz) {
+  uint64_t u;
   queue_add((struct event *)data);
+
+  u = 1;
+  if (write(queue_eventfd, &u, sizeof u) != sizeof u) {
+    perror("write");
+    exit(EXIT_FAILURE);
+  }
   return 0;
 }
 
@@ -190,8 +198,17 @@ int ride_run(int argc, char *argv[]) {
   int ring_fd;
   int err;
 
+  // setup queue
   queue_init();
 
+  // setup eventfd for queue notifications
+  queue_eventfd = eventfd(0, EFD_SEMAPHORE);
+  if (queue_eventfd == -1) {
+    perror("eventfd");
+    return EXIT_FAILURE;
+  }
+
+  // initialize and load bpf program
   obj = ride_bpf__open();
   if (!obj) {
     fprintf(stderr, "bpf open error: %s\n", strerror(-errno));
@@ -210,6 +227,7 @@ int ride_run(int argc, char *argv[]) {
   ring_fd = bpf_map__fd(obj->maps.rb);
   rb = ring_buffer__new(ring_fd, ride_ringbuf_handle, NULL, NULL);
 
+  // create worker threads
   pthread_t threads[args.threads];
   for (long i = 0; i < args.threads; i++) {
     struct worker_args *wargs = malloc(sizeof(struct worker_args));
@@ -220,6 +238,7 @@ int ride_run(int argc, char *argv[]) {
     wargs->id = i;
     wargs->verify = args.verify;
     wargs->io_concurrency = args.io_concurrency;
+    wargs->queue_eventfd = queue_eventfd;
     pthread_create(&threads[i], NULL, &worker_run, (void *)wargs);
   }
 
@@ -244,9 +263,11 @@ int ride_run(int argc, char *argv[]) {
   printf("Shutdown signal received, exiting.\n");
 
   // exit and cleunup
-  pthread_mutex_lock(&queue_lock);
-  pthread_cond_broadcast(&queue_cond);
-  pthread_mutex_unlock(&queue_lock);
+  uint64_t u = 1;
+  if (write(queue_eventfd, &u, sizeof u) != sizeof u) {
+    perror("write");
+    exit(EXIT_FAILURE);
+  }
 
   for (size_t i = 0; i < args.threads; i++) {
     pthread_join(threads[i], NULL);

@@ -69,6 +69,7 @@ int BPF_PROG(ride, struct file *file) {
   int plen = bpf_path_d_path(&file->f_path, ev->path, sizeof(ev->path));
   plen -= 1; // bpf_path_d_path returns size, i.e. nul included, we want length
   ev->path[sizeof(ev->path) - 1] = '\0';
+  ev->path_len = plen;
 
   if (!in_watch_path(ev->path, plen)) {
     bpf_ringbuf_discard(ev, 0);
