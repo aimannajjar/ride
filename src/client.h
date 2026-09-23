@@ -21,11 +21,13 @@ struct client {
 
   // conn/sock id
   uint8_t scid[16];
+  size_t stream_id;
   int sock_fd;
 };
 
 struct verifier_config client_verifier_config();
 void client_init(struct client *client, struct job_generic *init_job);
-int client_verify_request(struct client *client, const struct job_verify *job_verify);
+int client_verify_request(struct client *client,
+                          const struct job_verify *job_verify);
 
 #endif // CLIENT_H

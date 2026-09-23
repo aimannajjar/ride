@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/eventfd.h>
+#include <sys/signalfd.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -202,7 +203,8 @@ int ride_run(int argc, char *argv[]) {
   queue_init();
 
   // setup eventfd for queue notifications
-  queue_eventfd = eventfd(0, EFD_SEMAPHORE);
+  // TODO: shouldn't this also be EFD_NONBLOCK?
+  queue_eventfd = eventfd(0, EFD_SEMAPHORE | EFD_NONBLOCK);
   if (queue_eventfd == -1) {
     perror("eventfd");
     return EXIT_FAILURE;
@@ -275,7 +277,7 @@ int ride_run(int argc, char *argv[]) {
 
   ring_buffer__free(rb);
 
-#ifdef USERSPACE_TRACE
+#ifdef LOG_TRACE
   malloc_stats_print(NULL, NULL, NULL);
 #endif
   if (err)

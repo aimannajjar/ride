@@ -23,6 +23,8 @@ static struct addrinfo *remote_addr;
 #define RIDE_ALPN "\x07ride0.1"
 #define RIDE_ALPN_LEN 8
 #define MAX_DATAGRAM_SIZE 1350
+#define MAX_IDLE_TIMEOUT 1000
+#define RETRY_BACKOFF 100
 
 struct verifier_config client_verifier_config() {
   return (struct verifier_config){
@@ -61,7 +63,7 @@ int flush_out(struct client *client) {
       return 0;
 
     if (n < 0) {
-      log_debug("Failed to write packet: %zd", n);
+      log_error("Failed to write packet: %zd", n);
       return n;
     }
 
@@ -77,7 +79,12 @@ int flush_out(struct client *client) {
     socklen_t len = info.to_len;
 
     n = sendto(client->sock_fd, out, n, 0, dst, len);
-    log_trace("sent %zd bytes", n);
+    if (n < 0) {
+      log_error("Failed to write packet: %zd", n);
+      return n;
+    }
+
+    log_debug("sent %zd bytes", n);
     return n;
   }
 }
@@ -155,19 +162,22 @@ static int client_new_quiche_conn(struct client *client) {
     return -1;
   }
 
+  log_debug("Quic connection created; sock fd=%d", client->sock_fd);
+
   return 0;
 }
 
-uint64_t client_advance(void *arg, int *out_sock_fd);
+int64_t client_advance(void *arg, int flags, int *out_sock_fd);
 
 void client_init(struct client *client, struct job_generic *background_job) {
   client->quiche_conn = NULL;
   client->quiche_config = quiche_config_new(QUICHE_PROTOCOL_VERSION);
   client->local_addr_len = sizeof client->local_addr;
+  client->stream_id = 0;
 
   quiche_config_set_application_protos(client->quiche_config,
                                        (uint8_t *)RIDE_ALPN, RIDE_ALPN_LEN);
-  quiche_config_set_max_idle_timeout(client->quiche_config, 10000000);
+  quiche_config_set_max_idle_timeout(client->quiche_config, MAX_IDLE_TIMEOUT);
   quiche_config_set_max_recv_udp_payload_size(client->quiche_config,
                                               MAX_DATAGRAM_SIZE);
   quiche_config_set_max_send_udp_payload_size(client->quiche_config,
@@ -186,7 +196,7 @@ void client_init(struct client *client, struct job_generic *background_job) {
   background_job->callback_arg = client;
 }
 
-static int client_connect(struct client *client) {
+static int client_new_connection(struct client *client) {
   int sock_fd = 0;
 
   // create socket for this client instance
@@ -228,78 +238,78 @@ static int client_connect(struct client *client) {
   return 0;
 }
 
-uint64_t client_advance(void *arg, int *out_sock_fd) {
-  int64_t timeout, timeout_seconds;
+void client_close_connection(struct client *client) {
+  quiche_conn_free(client->quiche_conn);
+  client->quiche_conn = NULL;
+  client->sock_fd = 0;
+  // TODO: close and collect old sockets
+}
+
+int64_t client_advance(void *arg, int flags, int *out_sock_fd) {
+  int64_t timeout;
   size_t proto_len;
+  bool was_connected;
   const uint8_t *proto = NULL;
-  struct timespec expiry;
-  struct timeval now;
   struct client *client = (struct client *)arg;
+
+  if (client->quiche_conn && quiche_conn_is_closed(client->quiche_conn)) {
+    // stale connection
+    log_info("Connection closed, reconnecting");
+    client_close_connection(client);
+    *out_sock_fd = 0;
+
+    // TODO: implement exponential backoff algorithm
+    return RETRY_BACKOFF;
+  }
 
   if (!client->quiche_conn) {
     log_debug("Connecting...");
-    if (client_connect(client)) {
+    if (client_new_connection(client)) {
       log_error("could not create quich conn");
-      return 1;
+      return RETRY_BACKOFF;
     }
+    *out_sock_fd = client->sock_fd;
   }
 
-  if (quiche_conn_is_established(client->quiche_conn)) {
-    quiche_conn_application_proto(client->quiche_conn, &proto, &proto_len);
-  }
+  was_connected = quiche_conn_is_established(client->quiche_conn);
 
   // Process time out if we've timed out
-  gettimeofday(&now, NULL);
-  if (now.tv_sec >= client->expiry.tv_sec) {
-    log_debug("conn timeout. timer tv_sec=%ld, tv_nsec=%ld. now "
-              "tv_sec=%ld tv_nsec=%ld",
-              client->expiry.tv_sec, client->expiry.tv_nsec, now.tv_sec,
-              now.tv_usec);
+  if (flags & VBG_TIMEOUT) {
+    if (quiche_conn_is_established(client->quiche_conn)) {
+      quiche_conn_send_ack_eliciting(client->quiche_conn);
+    }
     quiche_conn_on_timeout(client->quiche_conn);
-    goto egress;
-  } else {
-    log_trace("we did not time out. timer tv_sec=%ld, tv_nsec=%ld. now "
-              "tv_sec=%ld tv_nsec=%ld",
-              client->expiry.tv_sec, client->expiry.tv_nsec, now.tv_sec,
-              now.tv_usec);
   }
 
   // process receives
-  client_process_receive(client);
-  *out_sock_fd = client->sock_fd;
+  if (flags & VBG_RECV) {
+    client_process_receive(client);
+  }
 
-egress:
   // process sends
   flush_out(client);
 
-  // re-arm timer
-  timeout = quiche_conn_timeout_as_millis(client->quiche_conn);
-  if (timeout <= 0) {
-    timeout = 1000;
-    client->expiry.tv_nsec = 0;
-    client->expiry.tv_sec = 0;
-  } else {
-    timeout_seconds = timeout / 1000;
-    expiry.tv_sec = now.tv_sec + timeout_seconds;
-    expiry.tv_nsec = now.tv_usec * 1000 + (timeout - timeout_seconds) * 1000000;
-    if (expiry.tv_nsec > 999999) {
-      expiry.tv_sec += 1;
-      expiry.tv_nsec -= 999999;
-    }
-    client->expiry.tv_sec = expiry.tv_sec;
-    client->expiry.tv_nsec = expiry.tv_nsec;
-    log_debug("armed timer to tv_sec=%ld, tv_nsec=%ld", client->expiry.tv_sec,
-              client->expiry.tv_nsec);
+  if (!was_connected && quiche_conn_is_established(client->quiche_conn)) {
+    quiche_conn_application_proto(client->quiche_conn, &proto, &proto_len);
+    log_info("Connected to remote verifier");
   }
 
+  timeout = quiche_conn_timeout_as_millis(client->quiche_conn);
+  timeout = timeout < MAX_IDLE_TIMEOUT / 2 ? timeout : MAX_IDLE_TIMEOUT / 2;
+  if (!timeout)
+    timeout = 1;
+  else if (timeout < 0)
+    timeout = RETRY_BACKOFF;
+
+#ifdef DEBUG
   // log loop progress
   quiche_stats stats;
   const uint8_t *trace_id;
   size_t trace_id_size;
   quiche_conn_stats(client->quiche_conn, &stats);
   quiche_conn_trace_id(client->quiche_conn, &trace_id, &trace_id_size);
-  log_debug("conn id=\"%.*s\" established=%d, closed=%d timeout=%ld",
-            (int)trace_id_size, trace_id,
+  log_debug("conn id=\"%.*s\" sock_fd=%d established=%d, closed=%d timeout=%ld",
+            (int)trace_id_size, trace_id, client->sock_fd,
             quiche_conn_is_established(client->quiche_conn),
             quiche_conn_is_closed(client->quiche_conn), timeout);
 
@@ -307,6 +317,7 @@ egress:
             "stream blocked sends: %zd, stream blocked recvs: %zd",
             stats.sent_bytes, stats.stream_data_blocked_sent_count,
             stats.stream_data_blocked_recv_count);
+#endif
 
   return timeout;
 }
@@ -318,26 +329,25 @@ int client_verify_request(struct client *client,
       quiche_conn_is_closed(client->quiche_conn)) {
     log_error("could not send verify requst (connection closed): %s",
               job_verify->param.path);
-    exit(1);
     return -1;
   }
   uint64_t err;
   ssize_t n;
 
   err = 0;
-  if ((n = quiche_conn_stream_send(client->quiche_conn, 0, job_verify->payload,
-                                   sizeof job_verify->payload, true, &err)) <
-          0 &&
+  if ((n = quiche_conn_stream_send(
+           client->quiche_conn, client->stream_id, job_verify->payload,
+           sizeof job_verify->payload, true, &err)) < 0 &&
       n != QUICHE_ERR_DONE) {
     log_error("could not send verify requst (ret=%zd, err=%ld): %s", n, err,
               job_verify->param.path);
-    exit(1);
-    return -1;
+    return 0;
   }
   log_debug("sent verify requst (ret=%zd): %s", err, job_verify->param.path);
-  flush_out(client);
-  return 0;
 
+  client->stream_id += 2;
+
+  // TODO: limit stats to debug builds
   quiche_stats stats;
   const uint8_t *trace_id;
   size_t trace_id_size;

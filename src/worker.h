@@ -8,6 +8,8 @@
 #include <stdint.h>
 
 #define MAX_CONCURRENT_TASKS 256
+#define VBG_TIMEOUT 0x1
+#define VBG_RECV 0x2
 
 struct worker_args {
   size_t id;             // for logging and debugging
@@ -20,7 +22,7 @@ struct worker_args {
 // loop issue callbacks, the callback can specify the next scheduling deadline
 // (timeout) and arg to be passed, as well as an fd to add to the event loop
 // block/watch poll
-typedef uint64_t (*job_callback_t)(void *arg, int *out_sock_fd);
+typedef int64_t (*job_callback_t)(void *arg, int flags, int *out_sock_fd);
 struct job_generic {
   // callback requirements:
   //  1. callback_arg (see below) is passed back as an argument
@@ -35,12 +37,6 @@ struct job_generic {
 };
 
 // verify jobs
-enum job_verify_state {
-  SENDING,
-  RETRYING,
-  DONE,
-};
-
 struct job_verify {
   union {
     struct {
@@ -49,7 +45,7 @@ struct job_verify {
     } param;
     uint8_t payload[HASH_LEN + MAX_FILENAME_LEN];
   };
-  enum job_verify_state state;
+  int retries;
 };
 
 void *worker_run(void *args);

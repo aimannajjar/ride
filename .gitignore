@@ -23,3 +23,6 @@ tests/tmp
 pki/
 perf.data
 perf.data.old
+
+# verifier db
+store.db

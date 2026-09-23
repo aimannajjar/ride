@@ -37,7 +37,7 @@ static void inline log_info(const char *fmt, ...) {
   time_t t = time(NULL);
   char *m = ctime(&t);
 
-  printf("[%.*s] \e[32m;INFO\[e0m;: ", (int)strlen(m) - 1, m);
+  printf("[%.*s] \e[32mINFO\e[0m;: ", (int)strlen(m) - 1, m);
   vprintf(fmt, ap);
   va_end(ap);
   printf("\n");

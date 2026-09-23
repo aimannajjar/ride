@@ -129,11 +129,11 @@ struct worker {
   bool verify;
 };
 
-#ifdef LOG_TRACE
-#define LIST_INTEGRITY_CHECK(worker, skip, print)                              \
-  (list_integrity_check(worker, skip, print))
+#ifdef DEBUG
+#define LIST_INTEGRITY_CHECK(worker, skip, verbose)                            \
+  (list_integrity_check(worker, skip, verbose))
 #else
-#define LIST_INTEGRITY_CHECK(worker, skip, print)
+#define LIST_INTEGRITY_CHECK(worker, skip, verbose)
 #endif
 
 [[maybe_unused]]
@@ -206,8 +206,10 @@ void static inline list_integrity_check(const struct worker *worker,
   COND_LOG("----------- free list ----------");
   slot = worker->free_slots;
   while (slot) {
+#ifdef LOG_TRACE
     if (verbose)
       printf("| %zd | -> ", slot->id);
+#endif
 
     // it's possible for slot to briefly appear in task and free list, this
     // happens when the job is returned to free_list but task still hasn't
@@ -224,8 +226,10 @@ void static inline list_integrity_check(const struct worker *worker,
     slot = slot->next;
   }
 
+#ifdef LOG_TRACE
   if (verbose)
     printf("\n");
+#endif
   COND_LOG("--------------------------------");
 
   for (i = 0; i < JOB_QUEUE_DEPTH; i++) {
@@ -235,10 +239,7 @@ void static inline list_integrity_check(const struct worker *worker,
     if (skip_slot_id == i)
       continue;
 
-    if (!seen_ids[i]) {
-      log_error("slot_id %zd not seen in any list", i);
-      exit(1);
-    }
+    ASSERT(seen_ids[i], "slot_id %zd not seen in any list", i);
   }
   log_trace("lists integrity validated");
 #undef COND_LOG
@@ -250,7 +251,9 @@ void static inline list_integrity_check(const struct worker *worker,
 // from enqueue_job
 static struct job_slot *enqueue_job(struct worker *worker,
                                     struct job_slot *job_slot) {
-  LIST_INTEGRITY_CHECK(worker, -1, false);
+  log_trace("enqueing a job");
+
+  LIST_INTEGRITY_CHECK(worker, (job_slot ? job_slot->id : -1), false);
 
   // take first available slot and move head
   if (!job_slot) {
@@ -282,6 +285,7 @@ static struct job_slot *enqueue_job(struct worker *worker,
 // or alternatively call requeue to add it back to queue list
 static struct job_slot *dequeue_job(struct worker *worker) {
   struct job_slot *job_slot;
+  log_trace("dequing first job from queue");
 
   LIST_INTEGRITY_CHECK(worker, -1, false);
 
@@ -304,22 +308,23 @@ static struct job_slot *dequeue_job(struct worker *worker) {
 
 // returns a job slot to free list
 static void return_job(struct worker *worker, struct job_slot *job_slot) {
-  LIST_INTEGRITY_CHECK(worker, -1, true);
-
   log_trace("returning job slot_id=%zd (%p) id=%zd (%p)", job_slot->id,
             job_slot, job_slot->job.id, &job_slot->job);
+
+  LIST_INTEGRITY_CHECK(worker, -1, true);
   job_slot->next = worker->free_slots;
   job_slot->prev = NULL; // free list is singly linked list
   worker->free_slots = job_slot;
-
   LIST_INTEGRITY_CHECK(worker, job_slot->job.id, false);
 }
 
 // This has the same effect as calling enqueue_job and passing job_slot
 static void requeue_job(struct worker *worker, struct job_slot *job_slot) {
-  LIST_INTEGRITY_CHECK(worker, -1, false);
   log_trace("requeuing job slot_id=%zd (%p) id=%zd (%p)", job_slot->id,
             job_slot, job_slot->job.id, &job_slot->job);
+
+  // skip job slot id check because slot is now floating before it's requeued
+  LIST_INTEGRITY_CHECK(worker, job_slot->id, false);
   enqueue_job(worker, job_slot);
   LIST_INTEGRITY_CHECK(worker, -1, false);
 }
@@ -414,6 +419,7 @@ static struct task *task_take(struct worker *worker) {
   struct job_slot *job_slot;
   struct task *task;
 
+  log_trace("taking a new task from queue");
   LIST_INTEGRITY_CHECK(worker, -1, false);
 
   if (worker->tsp == worker->nr_tasks) {
@@ -430,7 +436,6 @@ static struct task *task_take(struct worker *worker) {
   task->state = RUNNING;
 
   log_trace("took task tid = %zd", tid);
-
   LIST_INTEGRITY_CHECK(worker, -1, true);
 
   return task;
@@ -478,6 +483,8 @@ void enqueue_job_verify(struct worker *worker, const struct job_hash *hjob) {
 
   memcpy(job->as.verify_job.param.path, hjob->path,
          sizeof(job->as.verify_job.param.path));
+
+  job->as.verify_job.retries = 0;
   job->type = VERIFY;
 }
 
@@ -529,52 +536,64 @@ static void job_generic_free(struct job *job) {
   job->as.generic_job.callback = NULL;
 };
 
-static void job_hash_free(struct job *job) {
-  // close(job->as.hash_job.fd);
+static void job_hash_free(struct job *job) { close(job->as.hash_job.fd); }
+
+// task_free: frees both the task executor and job_slot being executed by it
+// - keep_job: set to true if you don't want to free the job_slot
+//      useful when you plan to reschedule the job and want state preserved
+static void task_free(struct worker *worker, struct task *task, bool keep_job) {
+  struct job_slot *job_slot;
+  struct job *job;
+  [[maybe_unused]] size_t skip_check;
+
+  log_trace("freeing task %ld, slot id: %zd, type: %s", task->id,
+            task->job_slot->id, job_type_name(task->job_slot->job.type));
+
+  LIST_INTEGRITY_CHECK(worker, -1, false);
+  job_slot = task->job_slot;
+  job = &task->job_slot->job;
+  skip_check = job_slot->id;
+  if (!keep_job) {
+    switch (job->type) {
+    case HASH:
+      job_hash_free(job);
+      break;
+    case PRINT:
+      job_print_free(job);
+      break;
+    case GENERIC:
+      job_generic_free(job);
+    case VERIFY:
+      // TODO
+      break;
+    default:
+      assert(false && "not implemented");
+      break;
+    }
+
+    // move slot back from queued to free list
+    return_job(worker, job_slot);
+
+    skip_check = -1; // no need to skip check, slot should appea in free list
+  }
+
+  // free up task executor and push its id to stack
+  task->job_slot = NULL;
+  task->state = IDLE;
+  worker->free_tids[--worker->tsp] = task->id;
+  LIST_INTEGRITY_CHECK(worker, skip_check, false);
 }
 
 static void task_reschedule(struct worker *worker, struct task *task) {
   struct job_slot *job_slot;
   job_slot = task->job_slot;
+  log_trace("rescheduling task %ld, slot id: %zd, type: %s", task->id,
+            task->job_slot->id, job_type_name(task->job_slot->job.type));
 
-  // free up task executor and push its id to stack
-  task->job_slot = NULL;
-  task->state = IDLE;
-  worker->free_tids[--worker->tsp] = task->id;
+  task_free(worker, task, true);
 
   // put the job back on queue list to reschedule it
   requeue_job(worker, job_slot);
-}
-
-static void task_free(struct worker *worker, struct task *task) {
-  LIST_INTEGRITY_CHECK(worker, -1, false);
-  struct job_slot *job_slot;
-  struct job *job;
-
-  job_slot = task->job_slot;
-  job = &task->job_slot->job;
-  switch (job->type) {
-  case HASH:
-    job_hash_free(job);
-    break;
-  case PRINT:
-    job_print_free(job);
-    break;
-  case GENERIC:
-    job_generic_free(job);
-  case VERIFY:
-    assert(false && "not implemented");
-    break;
-  }
-
-  // move slot back from queued to free list
-  return_job(worker, job_slot);
-
-  // free up task executor and push its id to stack
-  task->job_slot = NULL;
-  task->state = IDLE;
-  worker->free_tids[--worker->tsp] = task->id;
-  LIST_INTEGRITY_CHECK(worker, -1, false);
 }
 
 void static inline print_hash_result(struct worker *worker,
@@ -629,6 +648,7 @@ void *worker_run(void *args) {
   struct epoll_event verifier_ev;
   uint64_t timeout;
   uint64_t verifier_fd;
+  int vbg_flags;
 
   wargs = (struct worker_args *)args;
   worker_setup(&worker, wargs);
@@ -638,6 +658,7 @@ void *worker_run(void *args) {
   // event loop
   timeout = 1;
   verifier_fd = 0;
+  vbg_flags = 0;
   while (!atomic_load_explicit(&quit, memory_order_acquire)) {
     int ret, fd;
     uint64_t ev_sem;
@@ -657,8 +678,12 @@ void *worker_run(void *args) {
           perror("read");
           exit(1);
         }
-      } // for other (non-queue) events or timeouts, read will be performed by
-        // respective task (e.g. verifier would consume socket event)
+        vbg_flags = 0;
+      } else if (ret && epevents[0].data.fd == verifier_fd) {
+        vbg_flags = VBG_RECV;
+      } else {
+        vbg_flags = VBG_TIMEOUT;
+      }
     } else {
       new_file_event = !queue_consume_try(&event);
     }
@@ -688,10 +713,21 @@ void *worker_run(void *args) {
         task_print_prep_submit(&worker, task);
         break;
       case VERIFY:
-        log_debug("schedule verify request: %s", job->as.verify_job.param.path);
+        log_debug("send verify request: %s", job->as.verify_job.param.path);
         if (client_verify_request(&worker.verifier, &job->as.verify_job)) {
-          log_error("rescheduling task");
-          task_reschedule(&worker, task);
+          log_debug("rescheduling task");
+          job->as.verify_job.retries++;
+
+          if (job->as.verify_job.retries > 3) {
+            log_error("maximum retries reached, gave up on verifying: file=%s",
+                      job->as.verify_job.param.path);
+            // TODO: accounting and log to disk
+            task_free(&worker, task, false);
+          } else {
+            task_reschedule(&worker, task);
+          }
+        } else {
+          task_free(&worker, task, false);
         }
         break;
       case GENERIC:
@@ -700,21 +736,31 @@ void *worker_run(void *args) {
         // ideally we want minimum timeout of all jobs but currently we only
         // have one job that publishes a timeout (verifier bg job)
         if (!(timeout = job->as.generic_job.callback(
-                  job->as.generic_job.callback_arg, &new_sock_fd))) {
+                  job->as.generic_job.callback_arg, vbg_flags, &new_sock_fd))) {
           // when generic job returns zero, it means it completed
           timeout = DEFAULT_TIMEOUT;
-          task_free(&worker, task);
+          task_free(&worker, task, false);
         } else {
           // non zero return, means task want to be rescheduled with returned
           // timeout
           task_reschedule(&worker, task);
         }
         if (new_sock_fd != verifier_fd) {
-          verifier_ev.events = EPOLLIN;
-          verifier_ev.data.fd = new_sock_fd;
-          log_debug("add verifier fd: %d to epoll set", new_sock_fd);
-          epoll_ctl(worker.epollfd, EPOLL_CTL_ADD, new_sock_fd, &verifier_ev);
-          verifier_fd = new_sock_fd;
+          // clean up old fd
+          if (verifier_fd) {
+            verifier_ev.events = EPOLLIN;
+            verifier_ev.data.fd = verifier_fd;
+            epoll_ctl(worker.epollfd, EPOLL_CTL_DEL, verifier_fd, &verifier_ev);
+            log_trace("remove old verifier fd: %d from epoll set", verifier_fd);
+          }
+
+          if (new_sock_fd) {
+            verifier_ev.events = EPOLLIN;
+            verifier_ev.data.fd = new_sock_fd;
+            log_trace("add verifier fd: %d to epoll set", new_sock_fd);
+            epoll_ctl(worker.epollfd, EPOLL_CTL_ADD, new_sock_fd, &verifier_ev);
+            verifier_fd = new_sock_fd;
+          }
         }
         break;
       default:
@@ -752,7 +798,7 @@ void *worker_run(void *args) {
           assert(false && "unreachable");
           break;
         }
-        task_free(&worker, task);
+        task_free(&worker, task, false);
         continue;
       } else if (cqes[i]->res > 0) {
         switch (job->type) {
@@ -784,10 +830,10 @@ void *worker_run(void *args) {
             enqueue_job_verify(&worker, &job->as.hash_job);
 
           // TODO: consider keeping around for zero-copy for the above
-          task_free(&worker, task);
+          task_free(&worker, task, false);
           break;
         case PRINT:
-          task_free(&worker, task);
+          task_free(&worker, task, false);
           break;
         default:
           assert(false && "unreachable");
