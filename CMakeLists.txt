@@ -7,7 +7,15 @@ project(ride
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -O3 -Wall -Werror")
-set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -Og -g -DDEBUG -DLOG_DEBUG")
+set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -Wall -Werror")
+
+option(DEBUG_QUIET "Make a debug build without logging")
+if (DEBUG_QUIET)
+  set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -Og -g -DDEBUG -DLOG_INFO")
+else()
+  set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -Og -g -DDEBUG -DLOG_DEBUG")
+endif()
+  
 
 # use official blake3 implementation
 include(FetchContent)
@@ -59,9 +67,9 @@ file(GLOB_RECURSE SOURCE_FILES
     src/main.c
     src/ride.c
     src/queue.c
-    src/worker.c
     src/hasher.c
-    src/client.c
+    src/processor.c
+    src/ev.c
 )
 
 add_executable(ride ${SOURCE_FILES})
