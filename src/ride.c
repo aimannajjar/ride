@@ -1,7 +1,7 @@
 #include "ride.h"
 #include "queue.h"
 #include "ride.skel.h"
-#include "worker.h"
+#include "processor.h"
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include <fcntl.h>
@@ -29,7 +29,8 @@ struct ride_cli_args {
 };
 
 atomic_int quit = 0;
-static int queue_eventfd;
+
+static uint32_t *queue_eventfd, queue_eventfd_len;
 
 /** most args are not actually used
  ** except for filename
@@ -37,8 +38,8 @@ static int queue_eventfd;
 static int parse_env(struct ride_cli_args *out, int argc, char *argv[]) {
   // -f [FP_ALG] = use fingerprinting, specify algorithm or defaults to BLAKE3
   //               currenlty only BLAKE3 is supported anyway
-  // -t [NUM_THREADS] how many worker threads
-  // -c [IO_CONCURRENCY] how many concurrent IO tasks *per* worker thread
+  // -t [NUM_THREADS] how many processor threads
+  // -c [IO_CONCURRENCY] how many concurrent IO tasks *per* processor thread
   const char optstring[] = ":f::t:c:v";
   while (1) {
     int ch = getopt(argc, argv, optstring);
@@ -97,11 +98,11 @@ static void ride_sig_handler([[maybe_unused]] int signal) {
 }
 
 static int ride_ringbuf_handle(void *ctx, void *data, size_t sz) {
-  uint64_t u;
+  // TODO: drop accounting
   queue_add((struct event *)data);
+  static int efd_next = 0;
 
-  u = 1;
-  if (write(queue_eventfd, &u, sizeof u) != sizeof u) {
+  if (eventfd_write(queue_eventfd[efd_next++ % queue_eventfd_len], 1)) {
     perror("write");
     exit(EXIT_FAILURE);
   }
@@ -196,16 +197,15 @@ int ride_run(int argc, char *argv[]) {
 
   struct ride_bpf *obj;
   struct ring_buffer *rb;
-  int ring_fd;
+  int ring_fd, quit_efd;
   int err;
 
   // setup queue
   queue_init();
 
-  // setup eventfd for queue notifications
-  // TODO: shouldn't this also be EFD_NONBLOCK?
-  queue_eventfd = eventfd(0, EFD_SEMAPHORE | EFD_NONBLOCK);
-  if (queue_eventfd == -1) {
+  // setup eventfd for quit notifications
+  quit_efd = eventfd(0, EFD_NONBLOCK);
+  if (quit_efd == -1) {
     perror("eventfd");
     return EXIT_FAILURE;
   }
@@ -229,19 +229,33 @@ int ride_run(int argc, char *argv[]) {
   ring_fd = bpf_map__fd(obj->maps.rb);
   rb = ring_buffer__new(ring_fd, ride_ringbuf_handle, NULL, NULL);
 
-  // create worker threads
+  // create processor threads
   pthread_t threads[args.threads];
+  queue_eventfd = malloc(args.threads * sizeof(uint32_t));
+  queue_eventfd_len = args.threads;
+  if (!queue_eventfd) {
+    perror("queue_eventfd");
+    return EXIT_FAILURE;
+  }
+
   for (long i = 0; i < args.threads; i++) {
-    struct worker_args *wargs = malloc(sizeof(struct worker_args));
+    struct processor_args *wargs = malloc(sizeof(struct processor_args));
     if (!wargs) {
       perror("malloc");
       return EXIT_FAILURE;
     }
+
+    // setup eventfd for queue notifications
+    queue_eventfd[i] = eventfd(0, EFD_SEMAPHORE | EFD_NONBLOCK);
+    if (queue_eventfd[i] == -1) {
+      perror("eventfd");
+      return EXIT_FAILURE;
+    }
     wargs->id = i;
-    wargs->verify = args.verify;
     wargs->io_concurrency = args.io_concurrency;
-    wargs->queue_eventfd = queue_eventfd;
-    pthread_create(&threads[i], NULL, &worker_run, (void *)wargs);
+    wargs->queue_eventfd = queue_eventfd[i];
+    wargs->quit_eventfd = quit_efd;
+    pthread_create(&threads[i], NULL, &processor_run, (void *)wargs);
   }
 
   if ((err = ride_bpf__attach(obj))) {
@@ -265,9 +279,8 @@ int ride_run(int argc, char *argv[]) {
   printf("Shutdown signal received, exiting.\n");
 
   // exit and cleunup
-  uint64_t u = 1;
-  if (write(queue_eventfd, &u, sizeof u) != sizeof u) {
-    perror("write");
+  if (eventfd_write(quit_efd, 1)) {
+    perror("eventfd_write");
     exit(EXIT_FAILURE);
   }
 

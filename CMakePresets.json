@@ -9,12 +9,53 @@
         "CMAKE_BUILD_TYPE": "Release",
         "ENABLE_FANALYZER": "ON"
       }
+    },
+    {
+      "name": "release",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "debug",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "DEBUG_QUIET": "OFF"
+      }
+    },
+    {
+      "name": "debug_quiet",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/debug_quiet",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "DEBUG_QUIET": "ON"
+      }
     }
   ],
   "buildPresets": [
     {
       "name": "analyze",
       "configurePreset": "analyze",
+      "jobs": 8
+    },
+    {
+      "name": "release",
+      "configurePreset": "release",
+      "jobs": 8
+    },
+    {
+      "name": "debug",
+      "configurePreset": "debug",
+      "jobs": 8
+    },
+    {
+      "name": "debug_quiet",
+      "configurePreset": "debug_quiet",
       "jobs": 8
     }
   ]

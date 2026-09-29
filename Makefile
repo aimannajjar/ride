@@ -1,4 +1,4 @@
-.PHONY: all gdb clean analyze perf_record perf_stat release test
+.PHONY: all gdb clean analyze perf_record perf_stat release testd debug trace debug_quiet
 
 NAME 				:= ride
 BUILD_DIR		:= build
@@ -14,12 +14,20 @@ all: debug
 
 ## userspace builds
 debug: $(BUILD_DIR)/$(NAME).skel.h 
-	cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
-	cmake --build build
+	cmake --preset=debug
+	cmake --build --preset=debug
+	ln -sf $(PWD)/build/debug/ride $(PWD)/build/ride
+	cp build/debug/compile_commands.json ./
 
 release: $(BUILD_DIR)/$(NAME).skel.h 
-	cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-	cmake --build build
+	cmake --preset=release
+	cmake --build --preset=release
+	ln -sf $(PWD)/build/release/ride $(PWD)/build/ride
+
+debug_quiet: $(BUILD_DIR)/$(NAME).skel.h 
+	cmake --preset=debug_quiet
+	cmake --build --preset=debug_quiet
+	ln -sf $(PWD)/build/debug_quiet/ride $(PWD)/build/ride
 
 ## tests & dev helpers
 gdb: debug
