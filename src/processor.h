@@ -13,6 +13,7 @@ struct processor_args {
   size_t io_concurrency; // how many concurrent task to execute
   int queue_eventfd;     // eventfd to monitor for queue signals (semaphore)
   int quit_eventfd;      // eventfd to monitor for quit signal
+  bool verify;
 };
 
 void *processor_run(void *args);

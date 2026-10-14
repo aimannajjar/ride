@@ -11,7 +11,7 @@ devenv.local.yaml
 
 compile_commands.json
 
-# CMake / Cargo
+# CMake
 build
 .cache
 target

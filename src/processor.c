@@ -171,7 +171,7 @@ static inline void processor_print_hash(struct processor *processor,
   }
 }
 
-void on_file_read(ev_io_req_t *req) {
+static void on_file_read(ev_io_req_t *req) {
   struct processor *processor;
   struct processor_iou_req *wreq;
   unsigned char hash[HASH_LEN];
@@ -205,7 +205,7 @@ void on_file_read(ev_io_req_t *req) {
   }
 }
 
-void on_file_open(ev_io_req_t *req) {
+static void on_file_open(ev_io_req_t *req) {
   struct processor *processor;
   struct processor_iou_req *wreq;
 
@@ -235,7 +235,7 @@ fail:
   processor_free_req(req);
 }
 
-void on_queue_event(ev_io_req_t *req) {
+static void on_queue_event(ev_io_req_t *req) {
   struct processor *processor;
   struct processor_iou_req *wreq;
   struct event event;

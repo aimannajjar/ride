@@ -11,11 +11,11 @@ RIDE consists of two parts:
 ### Implementation
 - The Hasher is written in C, the low-level access allows me to greatly tune for throughput and low-latency. The hasher relies on a hand-rolled `io_uring` implementation (I do not use liburing, or higher-level libraries like libuv), this allowed me to minimize latency using features not exposed by higher-level libraries. For instance, the hasher creates a separate `io_uring` instance per thread, with one of them in SQPOLL mode and others in normal mode. The SQPOLL ring allows the primary worker to submit requests with almost no syscalls, whereas the other workers are only used under increased load (this optimization is still WIP)
 
-- The Verifier is written in Rust. I plan to implement a rich set of features at the verifier level, such as a web interface for reports, various alerting plugins and I might allow myself a more liberal usage of 3rd-party libraries. Currently the Verifier communicates with the Hasher over `QUIC` (implemented using Cloudflare's `quiche` crate). It implements in-memory storage with coalesced writes to the filesystem. 
+- The Verifier is written in Go. I plan to implement a rich set of features at the verifier level, such as a web backend and interface for reports, various alerting plugins, all of which are a good git for Go's ecosystem. Go's concurrency model is also well-suited to lightweight tasks such as hash verification. Network communication will be implemented on top of QUIC protocol (leveraging `ngtcp2` for the client, `quic-go` for the server). 
 
 
 ### Current Results
-Despite being in early stages, RIDE is currently performing well within a practical range for its goals. I currently get 2000-2200 files hashed per second on a ThinkPad E14. This means you might be able to monitor your entire `/usr/bin`, and `/etc` for suspicious writes. I plan to implement a feature where each file is hashed twice, once using the file from page cache and once via `O_DIRECT`. This would help detect attacks that exploit page cache bugs such as `DirtyFrag`, `DirtyPipe` and `DirtyCOW`.
+Despite being in early stages, RIDE is currently performing well within a practical range for its goals. I currently get 2000-2200 files hashed per second on a ThinkPad E14. This means you might be able to monitor your entire `/usr/bin` and `/etc` for suspicious writes. I plan to implement a feature where each file is hashed twice, once using the file from page cache and once via `O_DIRECT`. This would help detect attacks that exploit page cache bugs such as `DirtyFrag`, `DirtyPipe` and `DirtyCOW`.
 
 
 ## AI Policy
