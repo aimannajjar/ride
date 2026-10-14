@@ -32,6 +32,7 @@
 
   languages.c.enable = true;
   languages.rust.enable = true;
+  languages.go.enable = true;
 
   scripts.gen-certs.exec = ''
     mkdir -p pki

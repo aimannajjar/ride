@@ -255,6 +255,7 @@ int ride_run(int argc, char *argv[]) {
     wargs->io_concurrency = args.io_concurrency;
     wargs->queue_eventfd = queue_eventfd[i];
     wargs->quit_eventfd = quit_efd;
+    wargs->verify = args.verify;
     pthread_create(&threads[i], NULL, &processor_run, (void *)wargs);
   }
 
