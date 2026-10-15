@@ -4,6 +4,7 @@
 #include "log.h"
 #include "queue.h"
 #include "ride.h"
+#include "verifier.h"
 #include <assert.h>
 #include <emmintrin.h>
 #include <fcntl.h>
@@ -21,40 +22,19 @@
 #include <sys/eventfd.h>
 #include <unistd.h>
 
-#define READ_BUF_SIZE 65536
-#define OUTPUT_MAX_SIZE 512
-
 // need 4K-aligned buffer for O_DIRECT reads
 static_assert(!(READ_BUF_SIZE & (4096 - 1)), "BUFFER SIZE must be 4K aligned");
 
-// we pre-allocate ev_io_req_t and hasher for performance despite hasher being
-// large, trading memory for throughput
-// TODO: consider alternatives for constrained memroy cases
+// container for ev_io_req and hasher
 struct processor_iou_req {
   ev_io_req_t req;
   struct hasher hasher;
   struct processor_iou_req *next;
   unsigned char *buffer;
   void *data;
+  void *data2;
   uint16_t in_flight;
   uint32_t id;
-};
-
-struct processor {
-  int queue_efd; // eventfd for main thread producer notifies (passed as warg)
-
-  // large 4k-aligned buffers indexed by executor (task id)
-  unsigned char (*buffers)[READ_BUF_SIZE];
-  struct processor_iou_req *reqs;      // pre-allocated slab for requests
-  struct processor_iou_req *reqs_list; // linked list to access the slab
-
-  // event loop
-  ev_io_req_t queue_poll_req;
-  ev_loop_t loop;
-
-  // accounting
-  size_t nr_tasks;
-  int id;
 };
 
 static void processor_prepare_poll_reqs(struct processor *processor);
@@ -75,6 +55,7 @@ static void processor_setup(struct processor *processor,
   processor->reqs = mallocx(
       processor->nr_tasks * sizeof(struct processor_iou_req), MALLOCX_ZERO);
   processor->reqs_list = processor->reqs;
+  processor->nr_free_reqs = processor->nr_tasks;
 
   if (!processor->buffers || !processor->reqs) {
     perror("malloc");
@@ -103,9 +84,9 @@ static void processor_free(struct processor *processor) {
   fflush(stderr);
 }
 
-static ev_io_req_t *processor_get_req(struct processor *processor) {
+ev_io_req_t *processor_get_req(struct processor *processor) {
   ev_io_req_t *req;
-  struct processor_iou_req *wreq;
+  struct processor_iou_req *preq; // preq is a container for req
 
   if (processor->reqs_list == NULL) {
     log_error("processor requests queue full");
@@ -113,40 +94,41 @@ static ev_io_req_t *processor_get_req(struct processor *processor) {
     exit(1);
   }
 
-  wreq = processor->reqs_list;
+  preq = processor->reqs_list;
   processor->reqs_list = processor->reqs_list->next;
 
-  assert(!wreq->in_flight && "req slot is already inflight");
-  wreq->in_flight = 1;
+  assert(!preq->in_flight && "req slot is already inflight");
+  preq->in_flight = 1;
 
-  // get a req slot and reset it, keep data2 becuase it points to pre-allocated
-  // buffer dedicated to this slot
-  req = &wreq->req;
-  req->poll_events = 0;
+  // get a req slot and reset it, keep data2 becuase it points to the container
+  // which includes pre-allocated buffers
+  req = &preq->req;
+  req->flags = 0;
   req->result = 0;
   req->data = processor;
-  req->data2 = wreq;
+  req->data2 = preq;
   req->off = 0;
   req->callback = NULL;
   req->opcode = 0;
   req->addr = 0;
   req->len = 0;
 
+  processor->nr_free_reqs--;
   return req;
 }
 
 void processor_free_req(ev_io_req_t *req) {
   struct processor *processor;
-  struct processor_iou_req *wreq;
+  struct processor_iou_req *preq;
   processor = req->data;
-  wreq = req->data2;
+  preq = req->data2;
 
-  log_trace("processor_free_req: req_id=%d fd=%d", wreq->id, req->fd);
-  assert(wreq->in_flight && "returning an already-free req slot ");
-  wreq->data = NULL;
-  wreq->in_flight = 0;
-  wreq->next = processor->reqs_list;
-  processor->reqs_list = wreq;
+  log_trace("processor_free_req: req_id=%d fd=%d", preq->id, req->fd);
+  preq->data = NULL;
+  preq->in_flight = 0;
+  preq->next = processor->reqs_list;
+  processor->reqs_list = preq;
+  processor->nr_free_reqs++;
 }
 
 static inline void processor_print_hash(struct processor *processor,
@@ -189,12 +171,14 @@ static void on_file_read(ev_io_req_t *req) {
   hasher_update(&wreq->hasher, req->result, (void *)req->addr);
 
   if (req->result == 0) {
-    // this was the final read, finalize hashing and print
-    // TODO: if this is expensive consider offloading to a thread pool
     hasher_finalize(&wreq->hasher, hash, HASH_LEN);
     processor_print_hash(processor, wreq, hash);
+    verifier_verify_hash(&processor->verifier, (size_t)wreq->data2,
+                         (char *)wreq->data, HASH_LEN, (char *)&hash);
   free:
     free((char *)wreq->data); // points to pathname string
+    wreq->data = NULL;
+    wreq->data2 = 0;
     processor_free_req(req);
     close(req->fd); // TODO: make async
     return;
@@ -215,7 +199,9 @@ static void on_file_open(ev_io_req_t *req) {
   wreq = req->data2;
   if (req->result < 0) {
     log_error("error opening %s: %s", wreq->data, strerror(-req->result));
-    free((char *)wreq->data); // addr points to pathname string
+    free((char *)wreq->data); // points to pathname string
+    wreq->data = NULL;
+    wreq->data2 = 0;
     goto fail;
   }
 
@@ -237,7 +223,7 @@ fail:
 
 static void on_queue_event(ev_io_req_t *req) {
   struct processor *processor;
-  struct processor_iou_req *wreq;
+  struct processor_iou_req *preq;
   struct event event;
   ev_io_req_t *open_req;
   uint32_t ret;
@@ -265,14 +251,15 @@ static void on_queue_event(ev_io_req_t *req) {
 
   // open file
   open_req = processor_get_req(processor);
-  wreq = open_req->data2;
+  preq = open_req->data2;
   open_req->opcode = IORING_OP_OPENAT;
   open_req->fd = AT_FDCWD;
   open_req->addr = (uintptr_t)strdup(event.path);
   open_req->len = 0;
-  open_req->poll_events = O_RDONLY;
+  open_req->flags = O_RDONLY;
   open_req->callback = on_file_open;
-  wreq->data = (void *)open_req->addr;
+  preq->data = (void *)open_req->addr; // pathname
+  preq->data2 = (void *)event.path_len;
 
   if (!open_req->addr) {
     perror("strdup");
@@ -293,7 +280,7 @@ static void processor_prepare_poll_reqs(struct processor *processor) {
   queue_poll.opcode = IORING_OP_POLL_ADD;
   queue_poll.fd = processor->queue_efd;
   queue_poll.callback = on_queue_event;
-  queue_poll.poll_events = EPOLLIN | EPOLLEXCLUSIVE;
+  queue_poll.flags = EPOLLIN | EPOLLEXCLUSIVE;
   queue_poll.len = IORING_POLL_ADD_MULTI;
   queue_poll.data = processor;
 
@@ -309,6 +296,10 @@ void *processor_run(void *args) {
   wargs = (struct processor_args *)args;
   memset(&processor, 0, sizeof(processor));
   processor_setup(&processor, wargs);
+
+  log_error("Processor address is %p", (void *)&processor);
+  memset(&processor.verifier, 0, sizeof(struct verifier));
+  verifier_init(&processor.verifier, &processor, &processor.loop);
 
   ev_loop_run(&processor.loop);
 

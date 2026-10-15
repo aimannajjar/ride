@@ -1,3 +1,5 @@
+#ifndef LOG_H
+#define LOG_H
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -59,3 +61,4 @@ static void inline log_error(const char *fmt, ...) {
   fprintf(stderr, "\n");
 }
 
+#endif

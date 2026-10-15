@@ -1,13 +1,13 @@
 .PHONY: all gdb clean analyze perf_record perf_stat release testd debug trace debug_quiet
 
-NAME 				:= ride
-BUILD_DIR		:= build
-SRCS				:= $(wildcard src/*.c) src/log.h
-BPF_SRCS 		:= $(wildcard src/*.bpf.c)
-BPF_OBJS		:= $(BPF_SRCS:src/%.c=$(BUILD_DIR)/%.o)
+NAME        := ride
+BUILD_DIR   := build/debug
+SRCS        := $(wildcard src/*.c) src/log.h
+BPF_SRCS    := $(wildcard src/*.bpf.c)
+BPF_OBJS    := $(BPF_SRCS:src/%.c=$(BUILD_DIR)/%.o)
 BPF_INCLUDE := -I${LINUX} -I${LIBBPF} -I./src
-BPF_FLAGS		:= $(BPF_INCLUDE) -target bpf -g -O3 -std=gnu11 -c 
-BPF_CC 			:= clang
+BPF_FLAGS   := $(BPF_INCLUDE) -target bpf -g -O3 -std=gnu11 -c 
+BPF_CC      := clang
 
 ## default to debug build for dev
 all: debug
