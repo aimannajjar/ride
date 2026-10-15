@@ -6,19 +6,29 @@ project(ride
 )
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -O3 -Wall -Werror")
+set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -Wall -Werror")
 set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -Wall -Werror")
 
 option(DEBUG_QUIET "Make a debug build without logging")
 if (DEBUG_QUIET)
-  set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -Og -g -DDEBUG -DLOG_INFO")
+  set(_log_level LOG_INFO)
 else()
-  set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -Og -g -DDEBUG -DLOG_DEBUG")
+  set(_log_level LOG_DEBUG)
 endif()
-  
+add_library(build_flags INTERFACE)
 
-# use official blake3 implementation
+target_compile_options(build_flags INTERFACE 
+  -Wall -Werror
+  $<$<CONFIG:Debug>:-Og -g>
+)
+
+target_compile_definitions(build_flags INTERFACE
+  $<$<CONFIG:Debug>:DEBUG;${_log_level}>
+)
+
 include(FetchContent)
+
+# blake3
 FetchContent_Declare(
   blake3
   GIT_REPOSITORY https://github.com/BLAKE3-team/BLAKE3
@@ -28,24 +38,46 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(blake3)
 
-# Pull libquiche via corrosion
+# aws-lc (TLS for ngtcp2)
 FetchContent_Declare(
-  corrosion
-  GIT_REPOSITORY https://github.com/corrosion-rs/corrosion.git
-  GIT_TAG v0.6.1
+  aws-lc
+  GIT_REPOSITORY https://github.com/aws/aws-lc
+  GIT_TAG        v1.61.4
+  GIT_SHALLOW    TRUE
 )
-FetchContent_MakeAvailable(corrosion)
+FetchContent_MakeAvailable(aws-lc)
+
+# ngtcp2
+set(HAVE_SSL_SET_QUIC_EARLY_DATA_CONTEXT TRUE CACHE INTERNAL "" FORCE)
+set(BORINGSSL_SSL_LIBRARY     ssl    CACHE STRING "" FORCE)
+set(BORINGSSL_CRYPTO_LIBRARY  crypto CACHE STRING "" FORCE)
+set(ENABLE_BORINGSSL          ON     CACHE BOOL "" FORCE)
+set(ENABLE_OPENSSL            OFF    CACHE BOOL "" FORCE)
+set(ENABLE_SHARED_LIB         OFF    CACHE BOOL "" FORCE)
+set(ENABLE_STATIC_LIB         ON     CACHE BOOL "" FORCE)
+
+set(BORINGSSL_INCLUDE_DIR  "${aws-lc_SOURCE_DIR}/include")
+set(BORINGSSL_INCLUDE_DIRS "${aws-lc_SOURCE_DIR}/include")
+
+if (TARGET jitterentropy)
+  target_compile_options(jitterentropy PRIVATE -Wno-error=cpp)
+endif()
+
+foreach(tgt crypto_objects ssl crypto jitterentropy) 
+  # getting false positives, see https://github.com/aws/aws-lc/pull/191
+  target_compile_options(${tgt} PRIVATE -Wno-error=stringop-overflow)
+endforeach()
+
+if (TARGET ngtcp2_static)
+  target_compile_options(ngtcp2_static PRIVATE -Wno-error=inline)
+endif()
 
 FetchContent_Declare(
-  quiche
-  GIT_REPOSITORY https://github.com/cloudflare/quiche.git
-  GIT_TAG 0.29.3
+  ngtcp2
+  GIT_REPOSITORY https://github.com/ngtcp2/ngtcp2
+  GIT_TAG        main
 )
-FetchContent_MakeAvailable(quiche)
-
-corrosion_import_crate(MANIFEST_PATH ${quiche_SOURCE_DIR}/Cargo.toml
-  FEATURES ffi pkg-config-meta
-  CRATES quiche)
+FetchContent_MakeAvailable(ngtcp2)
 
 ## Enable static analyzer
 option(ENABLE_FANALYZER "Enable -fanalyzer")
@@ -63,17 +95,17 @@ if (ENABLE_FANALYZER)
   )
 endif()
 
-file(GLOB_RECURSE SOURCE_FILES 
+set(SOURCE_FILES 
     src/main.c
     src/ride.c
     src/queue.c
     src/hasher.c
     src/processor.c
     src/ev.c
+    src/verifier.c
 )
 
 add_executable(ride ${SOURCE_FILES})
-target_include_directories(ride PRIVATE ${CMAKE_SOURCE_DIR}/build
-  ${quiche_SOURCE_DIR}/quiche/include)
-target_link_libraries(ride PRIVATE jemalloc uring blake3 bpf quiche)
+target_include_directories(ride PRIVATE ${CMAKE_SOURCE_DIR}/build)
+target_link_libraries(ride PRIVATE build_flags jemalloc uring blake3 bpf ngtcp2_static ngtcp2_crypto_boringssl_static ssl crypto)
 

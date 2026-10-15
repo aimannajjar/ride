@@ -121,8 +121,9 @@ int ev_iou_req(ev_loop_t *loop, ev_io_req_t *req) {
   sqe->off = req->off;
   sqe->len = req->len;
   sqe->addr = req->addr;
-  sqe->poll32_events = req->poll_events;
+  sqe->poll32_events = req->flags;
   sqe->user_data = (uintptr_t)req;
+  sqe->flags = 0;
 
   log_debug(
       "submitting SQE: index=%d mask=0x%x08 raw_index(t)=%d opcode=%d fd=%d, "

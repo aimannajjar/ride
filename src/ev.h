@@ -15,7 +15,7 @@ typedef struct ev_io_req {
   uint64_t addr;
   int32_t fd;
   uint32_t len;
-  uint32_t poll_events;
+  uint32_t flags;
   int32_t result;
   uint32_t result_flags;
   void *data;

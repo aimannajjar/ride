@@ -1,39 +1,44 @@
 package server
 
 import (
-	"bufio"
 	"context"
+	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"io"
-	"os"
-	"path/filepath"
+	"math/big"
+	"time"
 
 	"github.com/quic-go/quic-go"
 )
 
 func VerifierServer(addr string, dbPath string) error {
-	listener, err := quic.ListenAddr(addr, generateTLSConfig(), nil)
+	quicConfig := &quic.Config{MaxIdleTimeout: time.Duration(30) * time.Second,
+		KeepAlivePeriod: time.Duration(15) * time.Second}
+
+	listener, err := quic.ListenAddr(addr, generateTLSConfig(), quicConfig)
 	if err != nil {
 		panic(err)
 	}
 	defer listener.Close()
 
-	fmt.Printf("Listening on %s", addr)
+	fmt.Printf("Listening on %s\n", addr)
 
 	conn, err := listener.Accept(context.Background())
 	if err != nil {
 		panic(err)
 	}
 
-
 	for {
 		// TODO: off-load to a goroutine
+		fmt.Println("Waiting for a stream");
 		stream, err := conn.AcceptStream(context.Background())
 		if err != nil {
 			panic(err)
 		}
+		fmt.Printf("Accepted stream\n");
 
 		payload, err := io.ReadAll(stream)
 		if err != nil {
@@ -41,47 +46,26 @@ func VerifierServer(addr string, dbPath string) error {
 		}
 
 		fmt.Printf("Received '%s'\n", string(payload))
-
 		stream.Close()
-
 	}
 
 }
-
 func generateTLSConfig() *tls.Config {
-	// TODO: offer generating or specifying pre-existing
-	cwd, err := os.Getwd()
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		panic(err)
 	}
-
-	keyPath := filepath.Join(cwd, "../pki", "key.pem")
-	certPath := filepath.Join(cwd, "../pki", "cert.pem")
-
-	keyFile, err := os.Open(keyPath)
-	if err != nil {
-		panic(err)
-	}
-
-	keyReader := bufio.NewReader(keyFile)
-	priv, err := rsa.GenerateKey(keyReader, 2048)
-
-	certFile, err := os.Open(certPath)
-	if err != nil {
-		panic(err)
-	}
-
-	certReader := bufio.NewReader(certFile)
-	certBytes, err := io.ReadAll(certReader)
+	template := x509.Certificate{SerialNumber: big.NewInt(1)}
+	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, priv.Public(), priv)
 	if err != nil {
 		panic(err)
 	}
 
 	return &tls.Config{
 		Certificates: []tls.Certificate{{
-			Certificate: [][]byte{certBytes},
+			Certificate: [][]byte{certDER},
 			PrivateKey:  priv,
 		}},
+		NextProtos: []string{"ride0.1"},
 	}
-
 }
