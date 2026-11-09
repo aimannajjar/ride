@@ -25,7 +25,7 @@ static uint64_t timestamp(void) {
   struct timespec tp;
 
   if (clock_gettime(CLOCK_MONOTONIC, &tp) != 0) {
-    log_error("clock_gettime: %s\n", strerror(errno));
+    LOG_ERROR("clock_gettime: %s\n", strerror(errno));
     exit(EXIT_FAILURE);
   }
 
@@ -50,7 +50,7 @@ static int verifier_send_packet(struct verifier *verifier, const uint8_t *data,
   } while (nwrite == -1 && errno == EINTR);
 
   if (nwrite == -1) {
-    log_error("sendmsg: %s\n", strerror(errno));
+    LOG_ERROR("sendmsg: %s\n", strerror(errno));
 
     return -1;
   }
@@ -128,9 +128,10 @@ static int verifier_flush_out(struct verifier *verifier) {
       switch (nwrite) {
       case NGTCP2_ERR_WRITE_MORE:
         stream->nwrite += (size_t)wdatalen;
+        log_trace("wrote %d/%d", stream->nwrite, stream->datalen);
         continue;
       default:
-        log_error("ngtcp2_conn_writev_stream: %s\n",
+        LOG_ERROR("ngtcp2_conn_writev_stream: %s\n",
                   ngtcp2_strerror((int)nwrite));
         ngtcp2_ccerr_set_liberr(&verifier->last_error, (int)nwrite, NULL, 0);
         return -1;
@@ -139,7 +140,7 @@ static int verifier_flush_out(struct verifier *verifier) {
 
     if (nwrite == 0) {
       if (stream)
-        log_error("wrote %d/%d", stream->nwrite, stream->datalen);
+        LOG_ERROR("wrote %d/%d", stream->nwrite, stream->datalen);
       return 0;
     }
 
@@ -185,7 +186,7 @@ static int get_new_connection_id_cb(ngtcp2_conn *conn, ngtcp2_cid *cid,
   return 0;
 }
 
-// TODO: adapt log_debug from log.h
+// TODO: adapt LOG_DEBUG from log.h
 static void log_printf(void *user_data, const char *fmt, ...) {
 #if defined(LOG_DEBUG) || defined(LOG_TRACE)
   va_list ap;
@@ -212,7 +213,7 @@ static int verifier_quic_get_slot(struct verifier *verifier) {
   if (rv != 0)
     return rv;
 
-  log_debug("opened new stream_id: %d", stream_id);
+  LOG_DEBUG("opened new stream_id: %d", stream_id);
   verifier->hash_req_slots[slot_id].stream.stream_id = stream_id;
   return slot_id;
 }
@@ -266,13 +267,13 @@ static int verifier_quic_init(struct verifier *verifier,
 
   dcid.datalen = NGTCP2_MIN_INITIAL_DCIDLEN;
   if (RAND_bytes(dcid.data, (int)dcid.datalen) != 1) {
-    log_error("RAND_bytes failed\n");
+    LOG_ERROR("RAND_bytes failed\n");
     return -1;
   }
 
   scid.datalen = 8;
   if (RAND_bytes(scid.data, (int)scid.datalen) != 1) {
-    log_error("RAND_bytes failed\n");
+    LOG_ERROR("RAND_bytes failed\n");
     return -1;
   }
 
@@ -292,7 +293,7 @@ static int verifier_quic_init(struct verifier *verifier,
                               NGTCP2_PROTO_VER_V1, &callbacks, &settings,
                               &params, NULL, verifier);
   if (rv != 0) {
-    log_error("ngtcp2_conn_client_new: %s\n", ngtcp2_strerror(rv));
+    LOG_ERROR("ngtcp2_conn_client_new: %s\n", ngtcp2_strerror(rv));
     return -1;
   }
 
@@ -304,7 +305,7 @@ static int verifier_quic_init(struct verifier *verifier,
 static int verifier_quic_handle_expiry(struct verifier *verifier) {
   int rv = ngtcp2_conn_handle_expiry(verifier->conn, timestamp());
   if (rv != 0) {
-    log_error("ngtcp2_conn_handle_expiry: %s\n", ngtcp2_strerror(rv));
+    LOG_ERROR("ngtcp2_conn_handle_expiry: %s\n", ngtcp2_strerror(rv));
     return -1;
   }
 
@@ -324,7 +325,7 @@ static int verifier_quic_read(struct verifier *verifier, size_t len) {
   rv = ngtcp2_conn_read_pkt(verifier->conn, &path, &pi, verifier->readbuf,
                             (size_t)len, timestamp());
   if (rv != 0) {
-    log_error("ngtcp2_conn_read_pkt: %s\n", ngtcp2_strerror(rv));
+    LOG_ERROR("ngtcp2_conn_read_pkt: %s\n", ngtcp2_strerror(rv));
     if (!verifier->last_error.error_code) {
       if (rv == NGTCP2_ERR_CRYPTO) {
         ngtcp2_ccerr_set_tls_alert(&verifier->last_error,
@@ -359,19 +360,19 @@ static uint64_t verifier_quic_flush(struct verifier *verifier) {
 static int verifier_ssl_init(struct verifier *verifier) {
   verifier->ssl_ctx = SSL_CTX_new(TLS_client_method());
   if (!verifier->ssl_ctx) {
-    log_error("SSL_CTX_new: %s", ERR_error_string(ERR_get_error(), NULL));
+    LOG_ERROR("SSL_CTX_new: %s", ERR_error_string(ERR_get_error(), NULL));
     exit(1);
   }
 
   if (ngtcp2_crypto_boringssl_configure_client_context(verifier->ssl_ctx) !=
       0) {
-    log_error("ngtcp2_crypto_quictls_configure_client_context failed");
+    LOG_ERROR("ngtcp2_crypto_quictls_configure_client_context failed");
     exit(1);
   }
 
   verifier->ssl = SSL_new(verifier->ssl_ctx);
   if (!verifier->ssl) {
-    log_error("SSL_new: %s\n", ERR_error_string(ERR_get_error(), NULL));
+    LOG_ERROR("SSL_new: %s\n", ERR_error_string(ERR_get_error(), NULL));
     exit(1);
   }
 

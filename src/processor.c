@@ -50,6 +50,8 @@ static void processor_setup(struct processor *processor,
   processor->id = wargs->id;
   processor->nr_tasks = wargs->io_concurrency;
   processor->queue_efd = wargs->queue_eventfd;
+  processor->verify = wargs->verify;
+  processor->quit_efd = wargs->quit_eventfd;
   processor->buffers =
       aligned_alloc(4096, processor->nr_tasks * sizeof(*processor->buffers));
   processor->reqs = mallocx(
@@ -71,7 +73,8 @@ static void processor_setup(struct processor *processor,
   }
   processor->reqs[processor->nr_tasks - 1].next = NULL;
 
-  log_debug("setup processor: queue_fd=%d", processor->queue_efd);
+  LOG_DEBUG("setup processor: queue_fd=%d quit_fd=%d", processor->queue_efd,
+            processor->quit_efd);
   ev_loop_init(&processor->loop);
   processor_prepare_poll_reqs(processor);
   processor_submit_poll_reqs(processor);
@@ -89,7 +92,7 @@ ev_io_req_t *processor_get_req(struct processor *processor) {
   struct processor_iou_req *preq; // preq is a container for req
 
   if (processor->reqs_list == NULL) {
-    log_error("processor requests queue full");
+    LOG_ERROR("processor requests queue full");
     // TODO: handle full queue
     exit(1);
   }
@@ -97,7 +100,7 @@ ev_io_req_t *processor_get_req(struct processor *processor) {
   preq = processor->reqs_list;
   processor->reqs_list = processor->reqs_list->next;
 
-  assert(!preq->in_flight && "req slot is already inflight");
+  assert(!preq->in_flight && "returned req slot is in flight");
   preq->in_flight = 1;
 
   // get a req slot and reset it, keep data2 becuase it points to the container
@@ -123,7 +126,7 @@ void processor_free_req(ev_io_req_t *req) {
   processor = req->data;
   preq = req->data2;
 
-  log_trace("processor_free_req: req_id=%d fd=%d", preq->id, req->fd);
+  LOG_TRACE("processor_free_req: req_id=%d fd=%d", preq->id, req->fd);
   preq->data = NULL;
   preq->in_flight = 0;
   preq->next = processor->reqs_list;
@@ -149,21 +152,21 @@ static inline void processor_print_hash(struct processor *processor,
   mlen += snprintf(debug + mlen, 5, "\" }\n");
   // TODO: make async
   if (write(1, debug, mlen) != mlen) {
-    log_error("error printing result: %s", strerror(errno));
+    LOG_ERROR("error printing result: %s", strerror(errno));
   }
 }
 
-static void on_file_read(ev_io_req_t *req) {
+static ev_cb_ret_t on_file_read(ev_io_req_t *req) {
   struct processor *processor;
   struct processor_iou_req *wreq;
   unsigned char hash[HASH_LEN];
 
-  log_trace("on_file_read: res=%d", req->result);
+  LOG_DEBUG("uring read event: req=%p res=%d fd=%d", req, req->result, req->fd);
 
   processor = req->data;
   wreq = req->data2;
   if (req->result < 0) {
-    log_error("error reading: fd=%d path=%s: %s", req->fd, wreq->data,
+    LOG_ERROR("error reading: fd=%d path=%s: %s", req->fd, wreq->data,
               strerror(-req->result));
     goto free;
   }
@@ -173,55 +176,72 @@ static void on_file_read(ev_io_req_t *req) {
   if (req->result == 0) {
     hasher_finalize(&wreq->hasher, hash, HASH_LEN);
     processor_print_hash(processor, wreq, hash);
-    verifier_verify_hash(&processor->verifier, (size_t)wreq->data2,
-                         (char *)wreq->data, HASH_LEN, (char *)&hash);
+
+    if (processor->verify)
+      verifier_verify_hash(&processor->verifier, (size_t)wreq->data2,
+                           (char *)wreq->data, HASH_LEN, (char *)&hash);
   free:
     free((char *)wreq->data); // points to pathname string
     wreq->data = NULL;
     wreq->data2 = 0;
     processor_free_req(req);
     close(req->fd); // TODO: make async
-    return;
+    return EV_SUCCESS;
   } else {
-    // re-arm
+    LOG_DEBUG("need re-arm read: req=%d req->result = %d req->fd = %d",
+              req->result, req->fd);
+    // re-arm (reuse same req slot)
     req->off += req->result;
+    req->result = 0;
     ev_iou_req(&processor->loop, req);
   }
+  return EV_SUCCESS;
 }
 
-static void on_file_open(ev_io_req_t *req) {
+static ev_cb_ret_t on_file_open(ev_io_req_t *req) {
   struct processor *processor;
   struct processor_iou_req *wreq;
 
-  log_debug("on_file_open: res=%d", req->result);
+  LOG_DEBUG("on_file_open: req=%p res=%d", req, req->result);
 
   processor = req->data;
   wreq = req->data2;
   if (req->result < 0) {
-    log_error("error opening %s: %s", wreq->data, strerror(-req->result));
+    LOG_ERROR("error opening %s: %s", wreq->data, strerror(-req->result));
     free((char *)wreq->data); // points to pathname string
     wreq->data = NULL;
     wreq->data2 = 0;
     goto fail;
   }
 
-  // read
+  // re-use same req for read
   req->opcode = IORING_OP_READ;
   req->fd = req->result;
   req->addr = (uintptr_t)wreq->buffer;
   req->len = READ_BUF_SIZE;
   req->off = 0;
+  req->result = 0;
   req->callback = on_file_read;
 
   hasher_init(&wreq->hasher);
   ev_iou_req(&processor->loop, req);
-  return;
+  return EV_SUCCESS;
 
 fail:
   processor_free_req(req);
+  return EV_SUCCESS;
 }
 
-static void on_queue_event(ev_io_req_t *req) {
+static ev_cb_ret_t on_quit_event(ev_io_req_t *req) {
+  if (req->result < 0) {
+    LOG_ERROR("on_quit_event error: %s\n", strerror(-req->result));
+    exit(1);
+  }
+
+  return EV_EXIT;
+}
+
+static ev_cb_ret_t on_queue_event(ev_io_req_t *req) {
   struct processor *processor;
   struct processor_iou_req *preq;
   struct event event;
@@ -229,27 +249,28 @@ static void on_queue_event(ev_io_req_t *req) {
   uint32_t ret;
 
   processor = (struct processor *)req->data;
-  log_debug("on_queue_event: res=%d", req->result);
+  LOG_DEBUG("queue_efd uring poll returned: %d", req->result);
 
   if (req->result < 0) {
-    log_error("queue_event error: %s\n", strerror(-req->result));
+    LOG_ERROR("queue_efd uring poll error: %s\n", strerror(-req->result));
     if (req->result == -EBADF || req->result == -EINVAL) {
       exit(1);
     }
     processor_submit_poll_reqs(processor);
-    return;
+    return EV_SUCCESS;
   }
 
   // consume queue
   memset(&event, 0, sizeof(struct event));
   if ((ret = queue_consume_try(&event, req->fd))) {
-    if (ret != EAGAIN) {
-      log_error("queue_consume returned: %d", ret);
-      goto arm;
-    }
+    if (ret != EAGAIN)
+      LOG_ERROR("queue_consume error: %d", ret);
+    LOG_DEBUG("queue_consume returned empty or error");
+    goto arm;
   }
 
   // open file
+  LOG_DEBUG("submitting open file op for: %*s", event.path_len, event.path);
   open_req = processor_get_req(processor);
   preq = open_req->data2;
   open_req->opcode = IORING_OP_OPENAT;
@@ -269,8 +290,10 @@ static void on_queue_event(ev_io_req_t *req) {
   ev_iou_req(&processor->loop, open_req);
 arm:
   if (!(req->result_flags & IORING_CQE_F_MORE)) {
+    LOG_DEBUG("kernel set IORING_CQE_F_MORE; need to re-arm queue_efd poll");
     processor_submit_poll_reqs(processor);
   }
+  return EV_SUCCESS;
 }
 
 static void processor_prepare_poll_reqs(struct processor *processor) {
@@ -283,8 +306,20 @@ static void processor_prepare_poll_reqs(struct processor *processor) {
   queue_poll.flags = EPOLLIN | EPOLLEXCLUSIVE;
   queue_poll.len = IORING_POLL_ADD_MULTI;
   queue_poll.data = processor;
-
   processor->queue_poll_req = queue_poll;
+
+  // quit event
+  ev_io_req_t quit_poll;
+  memset(&quit_poll, 0, sizeof(quit_poll));
+  quit_poll.opcode = IORING_OP_POLL_ADD;
+  quit_poll.fd = processor->quit_efd;
+  quit_poll.callback = on_quit_event;
+  quit_poll.flags = EPOLLIN;
+  quit_poll.len = IORING_POLL_ADD_MULTI;
+  quit_poll.data = processor;
+
+  processor->quit_poll_req = quit_poll;
+  ev_iou_req(&processor->loop, &processor->quit_poll_req);
 }
 
 // cppcheck-suppress unusedFunction
@@ -298,7 +333,8 @@ void *processor_run(void *args) {
   processor_setup(&processor, wargs);
 
   memset(&processor.verifier, 0, sizeof(struct verifier));
-  verifier_init(&processor.verifier, &processor, &processor.loop);
+  if (processor.verify)
+    verifier_init(&processor.verifier, &processor, &processor.loop);
 
   ev_loop_run(&processor.loop);
 

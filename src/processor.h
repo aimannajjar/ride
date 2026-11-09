@@ -14,9 +14,11 @@
 
 struct processor {
   int queue_efd; // eventfd for main thread producer notifies (passed as warg)
+  int quit_efd;
 
   // verifier
   struct verifier verifier;
+  bool verify;
 
   // large 4k-aligned buffers indexed by executor (task id)
   unsigned char (*buffers)[READ_BUF_SIZE];
@@ -26,6 +28,7 @@ struct processor {
 
   // event loop
   ev_io_req_t queue_poll_req;
+  ev_io_req_t quit_poll_req;
   ev_loop_t loop;
 
   // accounting

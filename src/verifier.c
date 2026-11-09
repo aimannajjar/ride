@@ -41,21 +41,23 @@ unlock:
   pthread_mutex_unlock(&mutex);
 }
 
-static void on_socket_timeout(ev_io_req_t *req) {
+static ev_cb_ret_t on_socket_timeout(ev_io_req_t *req) {
   struct verifier *verifier;
-  log_debug("QUIC timeout");
+  LOG_DEBUG("QUIC timeout");
 
   // TODO: handle timeout / timeout update errors
 
   verifier = req->data;
   verifier_quic_handle_expiry(verifier);
+  return EV_SUCCESS;
 }
 
-static void on_socket_timeout_update(ev_io_req_t *req) {
+static ev_cb_ret_t on_socket_timeout_update(ev_io_req_t *req) {
   // struct verifier *verifier;
-  log_debug("QUIC timeout updated");
+  LOG_DEBUG("QUIC timeout updated");
   // TODO: handle timeout / timeout update errors
   processor_free_req(req);
+  return EV_SUCCESS;
 }
 
 static void verifier_flush_egress(struct verifier *verifier) {
@@ -90,17 +92,17 @@ static void verifier_flush_egress(struct verifier *verifier) {
   }
   req->fd = 0; // verifier->sock_fd;
   req->len = 1;
-  log_debug("arming quic timer to sec=%ld nsec=%ld", verifier->expiry.tv_sec,
+  LOG_DEBUG("arming quic timer to sec=%ld nsec=%ld", verifier->expiry.tv_sec,
             verifier->expiry.tv_nsec);
   ev_iou_req(verifier->loop, req);
 }
 
-static void on_socket_read(ev_io_req_t *req) {
+static ev_cb_ret_t on_socket_read(ev_io_req_t *req) {
   struct verifier *verifier;
 
   verifier = req->data;
   if (req->result < 0) {
-    log_error("Failed to read: %s", strerror(-req->result));
+    LOG_ERROR("Failed to read: %s", strerror(-req->result));
     exit(1);
   }
 
@@ -112,24 +114,25 @@ static void on_socket_read(ev_io_req_t *req) {
 
   // drain writes
   verifier_flush_egress(verifier);
+  return EV_SUCCESS;
 }
 
-static void on_socket_connect(ev_io_req_t *req) {
+static ev_cb_ret_t on_socket_connect(ev_io_req_t *req) {
   struct verifier *verifier;
 
   // TODO: attempt next candidate from getaddrinfo
   if (req->result < 0) {
-    log_error("Failed to connect: %s", strerror(-req->result));
+    LOG_ERROR("Failed to connect: %s", strerror(-req->result));
     exit(1);
   }
 
-  log_debug("Connected");
+  LOG_DEBUG("Connected");
   verifier = req->data;
 
   if (verifier_quic_init(verifier, &verifier->remote_addr,
                          verifier->remote_addr_len, &verifier->local_addr,
                          verifier->local_addr_len)) {
-    log_error("QUIC initialization failed");
+    LOG_ERROR("QUIC initialization failed");
     exit(1);
   }
 
@@ -148,21 +151,22 @@ static void on_socket_connect(ev_io_req_t *req) {
   ev_iou_req(verifier->loop, req);
 
   verifier_flush_egress(verifier);
+  return EV_SUCCESS;
 }
 
-static void on_socket_create(ev_io_req_t *req) {
+static ev_cb_ret_t on_socket_create(ev_io_req_t *req) {
   struct verifier *verifier;
   verifier = req->data;
 
   // TODO: attempt next candidate from getaddrinfo
   if (req->result < 0) {
-    log_error("Failed to create socket: %s", strerror(-req->result));
+    LOG_ERROR("Failed to create socket: %s", strerror(-req->result));
     exit(1);
   }
 
   verifier->sock_fd = req->result;
   verifier->local_addr_len = sizeof(struct sockaddr_in);
-  log_debug("Created socket: %d", verifier->sock_fd);
+  LOG_DEBUG("Created socket: %d", verifier->sock_fd);
   if (getsockname(verifier->sock_fd, (struct sockaddr *)&verifier->local_addr,
                   &verifier->local_addr_len) != 0) {
     perror("getsockname");
@@ -171,7 +175,7 @@ static void on_socket_create(ev_io_req_t *req) {
 
   verifier->remote_addr_len = remote_addr->ai_addrlen;
   memcpy(&verifier->remote_addr, remote_addr->ai_addr, remote_addr->ai_addrlen);
-  log_debug("Remote Verifier IP: %s (addrlen=%d)",
+  LOG_DEBUG("Remote Verifier IP: %s (addrlen=%d)",
             inet_ntoa(((struct sockaddr_in *)&verifier->remote_addr)->sin_addr),
             verifier->remote_addr_len);
 
@@ -185,6 +189,7 @@ static void on_socket_create(ev_io_req_t *req) {
   req->callback = on_socket_connect;
   req->data = verifier;
   ev_iou_req(verifier->loop, req);
+  return EV_SUCCESS;
 }
 
 static void verifier_connect(struct verifier *verifier) {
@@ -213,9 +218,9 @@ void verifier_verify_hash(struct verifier *verifier, size_t pathlen,
 int verifier_init(struct verifier *verifier, struct processor *processor,
                   ev_loop_t *ev) {
   size_t i, size;
-  log_debug("Initializing verifier client");
+  LOG_DEBUG("Initializing verifier client");
   verifier->processor = processor;
-  log_debug("Porcessor address: %p", processor);
+  LOG_DEBUG("Porcessor address: %p", processor);
   verifier->loop = ev;
   verifier->last_timer_req = NULL;
   verifier->timer_req.opcode = 0;

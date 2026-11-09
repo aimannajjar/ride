@@ -5,8 +5,14 @@
 #include <string.h>
 #include <time.h>
 
+
+#define LOG_DEBUG(msg, ...) log_debug("%s: " msg, __FUNCTION__, ## __VA_ARGS__ )
+#define LOG_INFO(msg, ...) log_info("%s: " msg, __FUNCTION__, ## __VA_ARGS__ )
+#define LOG_ERROR(msg, ...) log_error("%s: " msg, __FUNCTION__, ## __VA_ARGS__ )
+#define LOG_TRACE(msg, ...) log_trace("%s: " msg, __FUNCTION__, ## __VA_ARGS__ )
+
 static void inline log_trace(const char *fmt, ...) {
-#ifdef LOG_TRACE
+#ifdef LOG_LEVEL_TRACE
   char ts[26];
   va_list ap;
   va_start(ap, fmt);
@@ -21,7 +27,7 @@ static void inline log_trace(const char *fmt, ...) {
 }
 
 static void inline log_debug(const char *fmt, ...) {
-#if defined(LOG_DEBUG) || defined(LOG_TRACE)
+#if defined(LOG_LEVEL_DEBUG) || defined(LOG_LEVEL_TRACE)
   char ts[26];
   va_list ap;
   va_start(ap, fmt);
