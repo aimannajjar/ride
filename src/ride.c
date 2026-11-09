@@ -98,7 +98,7 @@ static void ride_sig_handler([[maybe_unused]] int signal) {
 }
 
 static int ride_ringbuf_handle(void *ctx, void *data, size_t sz) {
-  // TODO: drop accounting
+  // TODO: drops' accounting
   queue_add((struct event *)data);
   static int efd_next = 0;
 

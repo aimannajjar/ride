@@ -4,10 +4,11 @@
 #include <stdint.h>
 
 typedef enum { EV_FULL = 1 } ev_err_t;
+typedef enum { EV_EXIT = -1, EV_SUCCESS } ev_cb_ret_t;
 
 typedef struct ev_io_req ev_io_req_t;
 
-typedef void (*callback_t)(ev_io_req_t *);
+typedef ev_cb_ret_t (*callback_t)(ev_io_req_t *);
 
 typedef struct ev_io_req {
   uint8_t opcode;
@@ -36,6 +37,7 @@ typedef struct ev_loop {
   struct io_uring_sqe *sqes;
   struct io_uring_cqe *cqes;
   int ringfd;
+  int pending;
 
 } ev_loop_t;
 

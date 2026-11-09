@@ -38,7 +38,7 @@ int queue_add(struct event *event) {
   memcpy(&queue.events[queue.head], event, sizeof(struct event));
   queue.head = (queue.head + 1) % QUEUE_SIZE;
   pthread_mutex_unlock(&queue_lock);
-  log_debug("added to queue: %.*s", event->path_len, event->path);
+  LOG_DEBUG("added to queue: %.*s", event->path_len, event->path);
   return 0;
 }
 
@@ -47,7 +47,7 @@ int queue_add(struct event *event) {
 int queue_consume_try(struct event *event, int efd) {
   eventfd_t ev = 0;
 
-  log_debug("entering queue_consume_try: efd=%d", efd);
+  LOG_DEBUG("entering queue_consume_try: efd=%d", efd);
   pthread_mutex_lock(&queue_lock);
   if (eventfd_read(efd, &ev)) {
     if (errno != EAGAIN) {
@@ -65,7 +65,7 @@ int queue_consume_try(struct event *event, int efd) {
   }
 
   memcpy(event, &queue.events[queue.tail], sizeof(struct event));
-  log_debug("queue_consume_try: %s", event->path);
+  LOG_DEBUG("consumed event path: %s", event->path);
   queue.tail = (queue.tail + 1) % QUEUE_SIZE;
   pthread_mutex_unlock(&queue_lock);
   return 0;

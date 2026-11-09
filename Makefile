@@ -1,7 +1,7 @@
 .PHONY: all gdb clean analyze perf_record perf_stat release testd debug trace debug_quiet
 
 NAME        := ride
-BUILD_DIR   := build/debug
+BUILD_DIR   := build
 SRCS        := $(wildcard src/*.c) src/log.h
 BPF_SRCS    := $(wildcard src/*.bpf.c)
 BPF_OBJS    := $(BPF_SRCS:src/%.c=$(BUILD_DIR)/%.o)
@@ -13,13 +13,13 @@ BPF_CC      := clang
 all: debug
 
 ## userspace builds
-debug: $(BUILD_DIR)/$(NAME).skel.h 
+debug: $(BUILD_DIR)/debug/$(NAME).skel.h 
 	cmake --preset=debug
 	cmake --build --preset=debug
 	ln -sf $(PWD)/build/debug/ride $(PWD)/build/ride
 	cp build/debug/compile_commands.json ./
 
-release: $(BUILD_DIR)/$(NAME).skel.h 
+release: $(BUILD_DIR)/release/$(NAME).skel.h 
 	cmake --preset=release
 	cmake --build --preset=release
 	ln -sf $(PWD)/build/release/ride $(PWD)/build/ride
@@ -31,7 +31,7 @@ debug_quiet: $(BUILD_DIR)/$(NAME).skel.h
 
 ## tests & dev helpers
 gdb: debug
-	sudo gdb --args ./build/ride ./tests/fixtures/test1.txt -t 1 -v
+	sudo gdb --args ./build/ride ./tests/fixtures/test1.txt -t 1 
 
 test: release
 	./tests/6_smoke_test_correctness.sh
@@ -48,16 +48,18 @@ perf_stat: $(BUILD_DIR)/$(NAME)
 	bash ./tests/0_perf_stat.sh
 
 ## bpf program
-$(BUILD_DIR)/$(NAME).skel.h: $(BPF_OBJS) | $(BUILD_DIR)
+$(BUILD_DIR)/debug/$(NAME).skel.h: $(BPF_OBJS) | $(BUILD_DIR)/debug
+	bpftool gen skeleton $< > $@
+
+$(BUILD_DIR)/release/$(NAME).skel.h: $(BPF_OBJS) | $(BUILD_DIR)/release
 	bpftool gen skeleton $< > $@
 
 $(BPF_OBJS): $(BPF_SRCS) | $(BUILD_DIR)
 	$(BPF_CC) $(BPF_FLAGS) $< -o $@
 
-
 ## build dir
-$(BUILD_DIR):
-	mkdir -p $(BUILD_DIR)
+$(BUILD_DIR)/debug $(BUILD_DIR)/release:
+	mkdir -p $@
 
 clean:
 	rm -rf *.o $(NAME).skel.h build

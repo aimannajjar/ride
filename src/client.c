@@ -55,15 +55,15 @@ unlock:
 int flush_out(struct client *client) {
   uint8_t out[MAX_DATAGRAM_SIZE] = {0};
   quiche_send_info info;
-  log_trace("flushing egress");
+  LOG_TRACE("flushing egress");
   while (true) {
     ssize_t n = quiche_conn_send(client->quiche_conn, out, sizeof out, &info);
-    log_trace("quiche_conn_send: %zd", n);
+    LOG_TRACE("quiche_conn_send: %zd", n);
     if (n == QUICHE_ERR_DONE)
       return 0;
 
     if (n < 0) {
-      log_error("Failed to write packet: %zd", n);
+      LOG_ERROR("Failed to write packet: %zd", n);
       return n;
     }
 
@@ -80,11 +80,11 @@ int flush_out(struct client *client) {
 
     n = sendto(client->sock_fd, out, n, 0, dst, len);
     if (n < 0) {
-      log_error("Failed to write packet: %zd", n);
+      LOG_ERROR("Failed to write packet: %zd", n);
       return n;
     }
 
-    log_debug("sent %zd bytes", n);
+    LOG_DEBUG("sent %zd bytes", n);
     return n;
   }
 }
@@ -104,14 +104,14 @@ int client_receive(struct client *client) {
     return n;
   }
 
-  log_debug("received %zd bytes.. feed into quiche", n);
+  LOG_DEBUG("received %zd bytes.. feed into quiche", n);
 
   quiche_recv_info info = {.from = (struct sockaddr *)&peer_addr,
                            .from_len = peer_addr_len,
                            .to = (struct sockaddr *)&client->local_addr,
                            .to_len = client->local_addr_len};
   n = quiche_conn_recv(client->quiche_conn, buf, n, &info);
-  log_debug("quiche_conn_recv: %zd", n);
+  LOG_DEBUG("quiche_conn_recv: %zd", n);
   if (n < 0)
     return n;
   return 0;
@@ -121,17 +121,17 @@ int client_receive(struct client *client) {
 // returns 0 when done
 // negative when errors
 int client_process_receive(struct client *client) {
-  log_trace("processing receives");
+  LOG_TRACE("processing receives");
   ssize_t n;
   while ((n = client_receive(client)) != -EWOULDBLOCK) {
     if (n == QUICHE_ERR_DONE)
       return 0;
     else if (n < 0) {
-      log_debug("error recv: %zd", n);
+      LOG_DEBUG("error recv: %zd", n);
     }
     continue;
   }
-  log_trace("recieve would block");
+  LOG_TRACE("recieve would block");
   return n;
 }
 
@@ -149,7 +149,7 @@ static int client_new_quiche_conn(struct client *client) {
     n += snprintf(scid_str + n, 3, "%c%c", hexchars[client->scid[i] > 4],
                   hexchars[client->scid[i] & 0xf]);
 
-  log_debug("My SCID: %s", scid_str);
+  LOG_DEBUG("My SCID: %s", scid_str);
 
   // create quiche connection
   client->quiche_conn = quiche_connect(
@@ -158,11 +158,11 @@ static int client_new_quiche_conn(struct client *client) {
       &client->remote_addr, client->remote_addr_len, client->quiche_config);
 
   if (!client->quiche_conn) {
-    log_error("could not create quiche connection");
+    LOG_ERROR("could not create quiche connection");
     return -1;
   }
 
-  log_debug("Quic connection created; sock fd=%d", client->sock_fd);
+  LOG_DEBUG("Quic connection created; sock fd=%d", client->sock_fd);
 
   return 0;
 }
@@ -215,7 +215,7 @@ static int client_new_connection(struct client *client) {
   }
 
   if (!sock_fd) {
-    log_debug("could not create socket");
+    LOG_DEBUG("could not create socket");
     exit(1);
   }
 
@@ -231,7 +231,7 @@ static int client_new_connection(struct client *client) {
   }
 
   if (client_new_quiche_conn(client)) {
-    log_error("could not create quich conn");
+    LOG_ERROR("could not create quich conn");
     return 1;
   }
 
@@ -254,7 +254,7 @@ int64_t client_advance(void *arg, int flags, int *out_sock_fd) {
 
   if (client->quiche_conn && quiche_conn_is_closed(client->quiche_conn)) {
     // stale connection
-    log_info("Connection closed, reconnecting");
+    LOG_INFO("Connection closed, reconnecting");
     client_close_connection(client);
     *out_sock_fd = 0;
 
@@ -263,9 +263,9 @@ int64_t client_advance(void *arg, int flags, int *out_sock_fd) {
   }
 
   if (!client->quiche_conn) {
-    log_debug("Connecting...");
+    LOG_DEBUG("Connecting...");
     if (client_new_connection(client)) {
-      log_error("could not create quich conn");
+      LOG_ERROR("could not create quich conn");
       return RETRY_BACKOFF;
     }
     *out_sock_fd = client->sock_fd;
@@ -291,7 +291,7 @@ int64_t client_advance(void *arg, int flags, int *out_sock_fd) {
 
   if (!was_connected && quiche_conn_is_established(client->quiche_conn)) {
     quiche_conn_application_proto(client->quiche_conn, &proto, &proto_len);
-    log_info("Connected to remote verifier");
+    LOG_INFO("Connected to remote verifier");
   }
 
   timeout = quiche_conn_timeout_as_millis(client->quiche_conn);
@@ -308,12 +308,12 @@ int64_t client_advance(void *arg, int flags, int *out_sock_fd) {
   size_t trace_id_size;
   quiche_conn_stats(client->quiche_conn, &stats);
   quiche_conn_trace_id(client->quiche_conn, &trace_id, &trace_id_size);
-  log_debug("conn id=\"%.*s\" sock_fd=%d established=%d, closed=%d timeout=%ld",
+  LOG_DEBUG("conn id=\"%.*s\" sock_fd=%d established=%d, closed=%d timeout=%ld",
             (int)trace_id_size, trace_id, client->sock_fd,
             quiche_conn_is_established(client->quiche_conn),
             quiche_conn_is_closed(client->quiche_conn), timeout);
 
-  log_debug("sent bytes=%zd, "
+  LOG_DEBUG("sent bytes=%zd, "
             "stream blocked sends: %zd, stream blocked recvs: %zd",
             stats.sent_bytes, stats.stream_data_blocked_sent_count,
             stats.stream_data_blocked_recv_count);
@@ -327,7 +327,7 @@ int client_verify_request(struct client *client,
   if (!client->quiche_conn ||
       !quiche_conn_is_established(client->quiche_conn) ||
       quiche_conn_is_closed(client->quiche_conn)) {
-    log_error("could not send verify requst (connection closed): %s",
+    LOG_ERROR("could not send verify requst (connection closed): %s",
               job_verify->param.path);
     return -1;
   }
@@ -339,11 +339,11 @@ int client_verify_request(struct client *client,
            client->quiche_conn, client->stream_id, job_verify->payload,
            sizeof job_verify->payload, true, &err)) < 0 &&
       n != QUICHE_ERR_DONE) {
-    log_error("could not send verify requst (ret=%zd, err=%ld): %s", n, err,
+    LOG_ERROR("could not send verify requst (ret=%zd, err=%ld): %s", n, err,
               job_verify->param.path);
     return 0;
   }
-  log_debug("sent verify requst (ret=%zd): %s", err, job_verify->param.path);
+  LOG_DEBUG("sent verify requst (ret=%zd): %s", err, job_verify->param.path);
 
   client->stream_id += 2;
 
@@ -353,7 +353,7 @@ int client_verify_request(struct client *client,
   size_t trace_id_size;
   quiche_conn_stats(client->quiche_conn, &stats);
   quiche_conn_trace_id(client->quiche_conn, &trace_id, &trace_id_size);
-  log_trace("conn \"%.*s\" stats: sent bytes=%zd, stream blocked sends: "
+  LOG_TRACE("conn \"%.*s\" stats: sent bytes=%zd, stream blocked sends: "
             "%zd, stream blocke dreceives: %zd",
             (int)trace_id_size, trace_id, stats.sent_bytes,
             stats.stream_data_blocked_sent_count,

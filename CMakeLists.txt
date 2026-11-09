@@ -11,9 +11,9 @@ set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -Wall -Werror")
 
 option(DEBUG_QUIET "Make a debug build without logging")
 if (DEBUG_QUIET)
-  set(_log_level LOG_INFO)
+  set(_log_level LOG_LEVEL_INFO)
 else()
-  set(_log_level LOG_DEBUG)
+  set(_log_level LOG_LEVEL_DEBUG)
 endif()
 add_library(build_flags INTERFACE)
 
@@ -63,9 +63,9 @@ if (TARGET jitterentropy)
   target_compile_options(jitterentropy PRIVATE -Wno-error=cpp)
 endif()
 
-foreach(tgt crypto_objects ssl crypto jitterentropy) 
+foreach(tgt crypto_objects ssl crypto jitterentropy fipsmodule) 
   # getting false positives, see https://github.com/aws/aws-lc/pull/191
-  target_compile_options(${tgt} PRIVATE -Wno-error=stringop-overflow)
+  target_compile_options(${tgt} PRIVATE -Wno-error=stringop-overflow -Wno-error=discarded-qualifiers)
 endforeach()
 
 if (TARGET ngtcp2_static)
@@ -106,6 +106,6 @@ set(SOURCE_FILES
 )
 
 add_executable(ride ${SOURCE_FILES})
-target_include_directories(ride PRIVATE ${CMAKE_SOURCE_DIR}/build)
+target_include_directories(ride PRIVATE ${CMAKE_BINARY_DIR} )
 target_link_libraries(ride PRIVATE build_flags jemalloc uring blake3 bpf ngtcp2_static ngtcp2_crypto_boringssl_static ssl crypto)
 
