@@ -58,7 +58,7 @@ $(BPF_OBJS): $(BPF_SRCS) | $(BUILD_DIR)
 	$(BPF_CC) $(BPF_FLAGS) $< -o $@
 
 ## build dir
-$(BUILD_DIR)/debug $(BUILD_DIR)/release:
+$(BUILD_DIR) $(BUILD_DIR)/debug $(BUILD_DIR)/release:
 	mkdir -p $@
 
 clean:

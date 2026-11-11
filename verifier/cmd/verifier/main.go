@@ -3,7 +3,6 @@ package main
 import (
 	"flag"
 	"fmt"
-	"log"
 
 	"github.com/aimannajjar/ride/verifier/internal/server"
 )
@@ -24,6 +23,8 @@ func main() {
 		usage()
 	}
 
+	server := server.NewServer("localhost:4433", *dbPath)
+
 	// TODO: handle kill signals and do proper clean up
-	log.Fatal(server.VerifierServer("localhost:4433", *dbPath)) // verifierServer should not return
+	server.Run()
 }

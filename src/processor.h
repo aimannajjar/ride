@@ -15,6 +15,7 @@
 struct processor {
   int queue_efd; // eventfd for main thread producer notifies (passed as warg)
   int quit_efd;
+  long queue_efd_data;
 
   // verifier
   struct verifier verifier;

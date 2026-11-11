@@ -1,7 +1,7 @@
 #include "ride.h"
+#include "processor.h"
 #include "queue.h"
 #include "ride.skel.h"
-#include "processor.h"
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include <fcntl.h>
@@ -9,7 +9,6 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdatomic.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,7 +29,14 @@ struct ride_cli_args {
 
 atomic_int quit = 0;
 
+#undef SINGLE_QUEUE_EFD // unset until we figure out why kernel is noityfing all
+                        // urings (causing thundering herd)
+
+#ifdef SINGLE_QUEUE_EFD
+static int queue_efd;
+#else
 static uint32_t *queue_eventfd, queue_eventfd_len;
+#endif
 
 /** most args are not actually used
  ** except for filename
@@ -100,12 +106,20 @@ static void ride_sig_handler([[maybe_unused]] int signal) {
 static int ride_ringbuf_handle(void *ctx, void *data, size_t sz) {
   // TODO: drops' accounting
   queue_add((struct event *)data);
-  static int efd_next = 0;
 
+#ifdef SINGLE_QUEUE_EFD
+  if (eventfd_write(queue_efd, 1)) {
+    perror("write");
+    exit(EXIT_FAILURE);
+  }
+#else
+  static int efd_next = 0;
   if (eventfd_write(queue_eventfd[efd_next++ % queue_eventfd_len], 1)) {
     perror("write");
     exit(EXIT_FAILURE);
   }
+#endif
+
   return 0;
 }
 
@@ -231,12 +245,21 @@ int ride_run(int argc, char *argv[]) {
 
   // create processor threads
   pthread_t threads[args.threads];
+
+#ifdef SINGLE_QUEUE_EFD
+  queue_efd = eventfd(0, EFD_SEMAPHORE | EFD_NONBLOCK);
+  if (queue_efd == -1) {
+    perror("eventfd");
+    return EXIT_FAILURE;
+  }
+#else
   queue_eventfd = malloc(args.threads * sizeof(uint32_t));
   queue_eventfd_len = args.threads;
   if (!queue_eventfd) {
-    perror("queue_eventfd");
+    perror("malloc");
     return EXIT_FAILURE;
   }
+#endif
 
   for (long i = 0; i < args.threads; i++) {
     struct processor_args *wargs = malloc(sizeof(struct processor_args));
@@ -245,17 +268,23 @@ int ride_run(int argc, char *argv[]) {
       return EXIT_FAILURE;
     }
 
+    wargs->id = i;
+    wargs->io_concurrency = args.io_concurrency;
+    wargs->quit_eventfd = quit_efd;
+    wargs->verify = args.verify;
+
     // setup eventfd for queue notifications
-    queue_eventfd[i] = eventfd(0, EFD_SEMAPHORE | EFD_NONBLOCK);
+#ifdef SINGLE_QUEUE_EFD
+    wargs->queue_eventfd = queue_efd;
+#else
+    queue_eventfd[i] = eventfd(0, 0); //EFD_SEMAPHORE | EFD_NONBLOCK);
     if (queue_eventfd[i] == -1) {
       perror("eventfd");
       return EXIT_FAILURE;
     }
-    wargs->id = i;
-    wargs->io_concurrency = args.io_concurrency;
     wargs->queue_eventfd = queue_eventfd[i];
-    wargs->quit_eventfd = quit_efd;
-    wargs->verify = args.verify;
+#endif
+
     pthread_create(&threads[i], NULL, &processor_run, (void *)wargs);
   }
 

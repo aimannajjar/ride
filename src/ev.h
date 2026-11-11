@@ -38,11 +38,12 @@ typedef struct ev_loop {
   struct io_uring_cqe *cqes;
   int ringfd;
   int pending;
+  int poll;
 
 } ev_loop_t;
 
 int ev_iou_req(ev_loop_t *loop, ev_io_req_t *req);
-int ev_loop_init(ev_loop_t *loop);
+int ev_loop_init(ev_loop_t *loop, int poll);
 int ev_loop_run(ev_loop_t *loop);
 
 #endif

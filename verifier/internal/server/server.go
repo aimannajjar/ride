@@ -11,45 +11,74 @@ import (
 	"math/big"
 	"time"
 
+	"github.com/aimannajjar/ride/verifier/internal/store"
 	"github.com/quic-go/quic-go"
 )
 
-func VerifierServer(addr string, dbPath string) error {
+const hashLength = 32
+
+type Server struct {
+	addr   string
+	dbPath string
+	store  *store.Store
+}
+
+func NewServer(addr string, dbPath string) *Server {
+	store := store.NewStore(dbPath)
+	return &Server{
+		addr:   addr,
+		dbPath: dbPath,
+		store:  store,
+	}
+}
+
+func (s *Server) Run() {
 	quicConfig := &quic.Config{MaxIdleTimeout: time.Duration(30) * time.Second,
 		KeepAlivePeriod: time.Duration(15) * time.Second}
 
-	listener, err := quic.ListenAddr(addr, generateTLSConfig(), quicConfig)
+	listener, err := quic.ListenAddr(s.addr, generateTLSConfig(), quicConfig)
 	if err != nil {
 		panic(err)
 	}
 	defer listener.Close()
 
-	fmt.Printf("Listening on %s\n", addr)
-
-	conn, err := listener.Accept(context.Background())
-	if err != nil {
-		panic(err)
-	}
+	fmt.Printf("Listening on %s\n", s.addr)
 
 	for {
-		// TODO: off-load to a goroutine
-		fmt.Println("Waiting for a stream");
+		conn, err := listener.Accept(context.Background())
+		if err != nil {
+			panic(err)
+		}
+
+		go s.handleClient(conn)
+	}
+
+}
+
+func (s *Server) handleClient(conn *quic.Conn) {
+	fmt.Println("Waiting for a stream")
+
+	for {
 		stream, err := conn.AcceptStream(context.Background())
 		if err != nil {
 			panic(err)
 		}
-		fmt.Printf("Accepted stream\n");
+		fmt.Printf("Accepted stream\n")
 
 		payload, err := io.ReadAll(stream)
 		if err != nil {
 			panic(err)
 		}
 
-		fmt.Printf("Received '%s'\n", string(payload))
+		hash := payload[:hashLength]
+		filename := string(payload[hashLength:])
+
+		fmt.Printf("Received hash for '%s'\n", filename)
+		s.store.Set(filename, hash)
 		stream.Close()
 	}
-
 }
+
 func generateTLSConfig() *tls.Config {
 	priv, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {

@@ -30,7 +30,7 @@ static const char *opname(int opcode) {
   }
 }
 
-static int ev__setup_io_uring(ev_loop_t *loop) {
+static int ev__setup_io_uring(ev_loop_t *loop, int poll) {
   struct io_uring_params params;
   struct ev__iou_ring sqe;
   struct ev__iou_ring cqe;
@@ -40,7 +40,7 @@ static int ev__setup_io_uring(ev_loop_t *loop) {
   int32_t ringfd;
 
   memset(&params, 0, sizeof params);
-  params.flags = IORING_SETUP_SQPOLL | IORING_SETUP_NO_SQARRAY;
+  params.flags = poll * IORING_SETUP_SQPOLL | IORING_SETUP_NO_SQARRAY;
   ringfd = io_uring_setup(IOU_SIZE_WANT, &params);
   if (ringfd < 1) {
     LOG_ERROR("io_uring_setup: %s", strerror(-ringfd));
@@ -80,6 +80,7 @@ static int ev__setup_io_uring(ev_loop_t *loop) {
   loop->cqes = cqes;
   loop->ringfd = ringfd;
   loop->pending = 0;
+  loop->poll = poll;
 
   LOG_DEBUG("initialized io_uring: sq_entries=%d sqe_mask=0x%x08 "
             "cqe_entries=%d cqe_mask=0x%x08",
@@ -107,14 +108,20 @@ static int ev__iou_submit(ev_loop_t *loop) {
   atomic_store_explicit((_Atomic uint32_t *)iou->tail,
                         *iou->tail + loop->pending, memory_order_release);
 
-  loop->pending = 0;
+  if (loop->poll) {
+    // check flags to see if kernel requested a wake up
+    flags = atomic_load_explicit((_Atomic uint32_t *)iou->flags,
+                                 memory_order_acquire);
 
-  // check flags to see if kernel requested a wake up
-  flags = atomic_load_explicit((_Atomic uint32_t *)iou->flags,
-                               memory_order_acquire);
-
-  if (flags & IORING_SQ_NEED_WAKEUP) {
-    if ((ret = io_uring_enter(loop->ringfd, 1, 0, IORING_ENTER_SQ_WAKEUP,
+    if (flags & IORING_SQ_NEED_WAKEUP) {
+      if ((ret = io_uring_enter(loop->ringfd, 1, 0, IORING_ENTER_SQ_WAKEUP,
+                                NULL)) < 0) {
+        printf("error: %s\n", strerror(-ret));
+        exit(1);
+      }
+    }
+  } else {
+    if ((ret = io_uring_enter(loop->ringfd, pending, 0, IORING_ENTER_GETEVENTS,
                               NULL)) < 0) {
       printf("error: %s\n", strerror(-ret));
       exit(1);
@@ -122,6 +129,7 @@ static int ev__iou_submit(ev_loop_t *loop) {
   }
 
   LOG_DEBUG("submitted %d SQEs", pending);
+  loop->pending = 0;
 
   return pending;
 }
@@ -162,10 +170,8 @@ int ev_iou_req(ev_loop_t *loop, ev_io_req_t *req) {
             req, opname(sqe->opcode), sqe->opcode, sqe->fd, sqe->off, sqe->len,
             sqe->addr, sqe->poll32_events, sqe->user_data);
 
-  // TODO: limit to SQPOLL rings so kernel thread can start doing work
-  // immediately during callback handling, otherwise, only send batched
-  // submissions
-  ev__iou_submit(loop);
+  if (loop->poll)
+    ev__iou_submit(loop);
   return 0;
 }
 
@@ -174,8 +180,8 @@ static int ev__io_poll(ev_loop_t *loop) {
   return io_uring_enter(loop->ringfd, 0, 1, IORING_ENTER_GETEVENTS, NULL);
 }
 
-int ev_loop_init(ev_loop_t *loop) {
-  ev__setup_io_uring(loop);
+int ev_loop_init(ev_loop_t *loop, int poll) {
+  ev__setup_io_uring(loop, poll);
   return 0;
 }
 

@@ -38,7 +38,7 @@ EMPTY_FILES=${5:-0}
 PERF=${6:-0} # 0 = none, 1 = record, 2 = stat
 DONT_LAUNCH=${7:-0} # if set, RIDE is assumed to be already running
 
-THREADS=1
+THREADS=2
 CONCURRENCY=128
 CORES="4,5,6,7,8" # NOTE: cores 0,1,2,3 reserved for load generator
                   # # of cores should be equal to THREADS + 1 (for main thread)

@@ -75,7 +75,9 @@ static void processor_setup(struct processor *processor,
 
   LOG_DEBUG("setup processor: queue_fd=%d quit_fd=%d", processor->queue_efd,
             processor->quit_efd);
-  ev_loop_init(&processor->loop);
+  // ev_loop_init(&processor->loop, !processor->id); // TODO: fix non-SQPOLL
+  // path,currently segfaults under open-loop
+  ev_loop_init(&processor->loop, 1);
   processor_prepare_poll_reqs(processor);
   processor_submit_poll_reqs(processor);
 }
@@ -262,7 +264,7 @@ static ev_cb_ret_t on_queue_event(ev_io_req_t *req) {
 
   // consume queue
   memset(&event, 0, sizeof(struct event));
-  if ((ret = queue_consume_try(&event, req->fd))) {
+  if ((ret = queue_consume(&event))) {
     if (ret != EAGAIN)
       LOG_ERROR("queue_consume error: %d", ret);
     LOG_DEBUG("queue_consume returned empty or error");
@@ -289,10 +291,8 @@ static ev_cb_ret_t on_queue_event(ev_io_req_t *req) {
 
   ev_iou_req(&processor->loop, open_req);
 arm:
-  if (!(req->result_flags & IORING_CQE_F_MORE)) {
-    LOG_DEBUG("kernel set IORING_CQE_F_MORE; need to re-arm queue_efd poll");
-    processor_submit_poll_reqs(processor);
-  }
+  LOG_DEBUG("kernel set IORING_CQE_F_MORE; need to re-arm queue_efd poll");
+  processor_submit_poll_reqs(processor);
   return EV_SUCCESS;
 }
 
@@ -300,11 +300,12 @@ static void processor_prepare_poll_reqs(struct processor *processor) {
   // queue events
   ev_io_req_t queue_poll;
   memset(&queue_poll, 0, sizeof(queue_poll));
-  queue_poll.opcode = IORING_OP_POLL_ADD;
+  queue_poll.opcode = IORING_OP_READ;
   queue_poll.fd = processor->queue_efd;
   queue_poll.callback = on_queue_event;
-  queue_poll.flags = EPOLLIN | EPOLLEXCLUSIVE;
-  queue_poll.len = IORING_POLL_ADD_MULTI;
+  queue_poll.flags = 0;
+  queue_poll.addr = (uintptr_t)&processor->queue_efd_data;
+  queue_poll.len = sizeof processor->queue_efd_data;
   queue_poll.data = processor;
   processor->queue_poll_req = queue_poll;
 
